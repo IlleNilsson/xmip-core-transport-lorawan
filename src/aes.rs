@@ -87,7 +87,7 @@ pub fn encrypt(key: &[u8; BLOCK], block: &[u8; BLOCK]) -> [u8; BLOCK] {
             }
         }
         if round != 10 {
-            for column in state.chunks_exact_mut(4) {
+            for column in state.as_chunks_mut::<4>().0 {
                 mix_column(column);
             }
         }
