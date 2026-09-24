@@ -31,6 +31,7 @@ use std::time::Duration;
 pub use frame::{Frame, Keys, MType};
 pub use server::NetworkServer;
 use transport::error::{Result, TransportError, protocol_error};
+use transport::held::Held;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::{Arrived, Directions, Transport};
 
@@ -302,37 +303,22 @@ impl LorawanTransport {
     }
 }
 
-/// The network server, holding what arrived whole.
-struct Served {
-    radio: Arc<LoopbackRadio>,
-    origin: String,
-}
-
-impl FarEnd for Served {
-    fn address(&self) -> &str {
-        &self.origin
-    }
-
-    fn take_one(self: Box<Self>) -> Result<Arrived> {
-        let (port, bytes) = self
-            .radio
-            .server()
-            .take()
-            .ok_or_else(|| protocol_error("nothing arrived at the network server"))?;
-        Ok(Arrived::new(format!("{}?port={port}", self.origin), bytes))
-    }
-}
-
 impl Loopback for LorawanTransport {
+    /// The network server, holding what arrived whole.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         let radio = self
             .loopback
             .as_ref()
             .ok_or_else(|| protocol_error("a concentrator, not a loopback radio"))?;
-        Ok(Box::new(Served {
-            radio: Arc::clone(radio),
-            origin: self.origin(),
-        }))
+        let radio = Arc::clone(radio);
+        let origin = self.origin();
+        Ok(Box::new(Held::new(origin.clone(), move || {
+            let (port, bytes) = radio
+                .server()
+                .take()
+                .ok_or_else(|| protocol_error("nothing arrived at the network server"))?;
+            Ok(Arrived::new(format!("{origin}?port={port}"), bytes))
+        })))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
