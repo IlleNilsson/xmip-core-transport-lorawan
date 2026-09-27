@@ -187,7 +187,7 @@ impl Frame {
             .block(0x49, u8::try_from(body.len()).unwrap_or(u8::MAX))
             .to_vec();
         covered.extend_from_slice(body);
-        if aes::cmac(&keys.nwk_s_key, &covered)[..4] != *mic {
+        if !aes::verifies(&keys.nwk_s_key, &covered, mic) {
             return Err(protocol_error("a MIC that does not check"));
         }
         frame.payload = aes::counter(&keys.app_s_key, &frame.block(0x01, 0), &body[9..]);
