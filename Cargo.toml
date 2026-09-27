@@ -15,9 +15,13 @@ path = "src/lib.rs"
 
 [dependencies]
 # A Technology depends on its parent Capability, never the reverse
-# (repository-model.md). Standard library otherwise: the framing is bytes
-# and the loopback is in this process.
+# (repository-model.md). The framing is bytes and the loopback is in this
+# process.
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
+# AES-128 and its CMAC, which every LoRaWAN key drives (aes.rs):
+# RustCrypto's, constant-time, the aes the estate's SFTP and Kerberos take.
+aes = "0.8"
+cmac = "0.7"
 # The settings this technology declares (xcore::settings), read through
 # transport::Configured (ADR-0064, amendment 2026-09-26).
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
