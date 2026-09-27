@@ -23,6 +23,7 @@
 pub mod aes;
 pub mod frame;
 pub mod server;
+mod settings;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
