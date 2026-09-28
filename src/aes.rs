@@ -1,13 +1,12 @@
 //! AES-128, the block cipher every `LoRaWAN` key drives, and the two uses the
 //! specification makes of it: CMAC (RFC 4493) for the MIC, and the counter
 //! blocks that encrypt the `FRMPayload`. The cipher is `RustCrypto`'s `aes`
-//! crate — the one the estate's SFTP and Kerberos take — constant-time on
+//! crate — the one the estate's SSH and Kerberos take — constant-time on
 //! every target, and CMAC is its `cmac` crate; what is here is how
 //! `LoRaWAN` uses them.
 
 use aes::Aes128;
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 use cmac::{Cmac, Mac};
 
 /// One block, and one key: sixteen bytes.
@@ -16,14 +15,14 @@ pub const BLOCK: usize = 16;
 /// `block` encrypted under `key`: one AES-128 block.
 #[must_use]
 pub fn encrypt(key: &[u8; BLOCK], block: &[u8; BLOCK]) -> [u8; BLOCK] {
-    let mut state = GenericArray::from(*block);
-    Aes128::new(GenericArray::from_slice(key)).encrypt_block(&mut state);
+    let mut state = Array::from(*block);
+    Aes128::new(&Array::from(*key)).encrypt_block(&mut state);
     state.into()
 }
 
 /// The CMAC of `message` under `key`, ready to finish or to check.
 fn mac(key: &[u8; BLOCK], message: &[u8]) -> Cmac<Aes128> {
-    let mut mac = <Cmac<Aes128> as KeyInit>::new(GenericArray::from_slice(key));
+    let mut mac = <Cmac<Aes128> as KeyInit>::new(&Array::from(*key));
     mac.update(message);
     mac
 }
@@ -46,10 +45,10 @@ pub fn verifies(key: &[u8; BLOCK], message: &[u8], mic: &[u8]) -> bool {
 /// encryption, which is its own inverse.
 #[must_use]
 pub fn counter(key: &[u8; BLOCK], first: &[u8; BLOCK], bytes: &[u8]) -> Vec<u8> {
-    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let cipher = Aes128::new(&Array::from(*key));
     let mut out = Vec::with_capacity(bytes.len());
     for (index, chunk) in bytes.chunks(BLOCK).enumerate() {
-        let mut block = GenericArray::from(*first);
+        let mut block = Array::from(*first);
         block[BLOCK - 1] = u8::try_from(index + 1).unwrap_or(u8::MAX);
         cipher.encrypt_block(&mut block);
         out.extend(chunk.iter().zip(block.iter()).map(|(b, s)| b ^ s));
