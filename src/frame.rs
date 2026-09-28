@@ -10,7 +10,7 @@ use crate::aes::{self, BLOCK};
 /// The most `FRMPayload` one frame carries: N for the fastest EU868 data rate
 /// (DR5, 230 bytes of `MACPayload` less the frame header and port). A slower
 /// data rate carries less; the specification's tables say how much.
-pub const MAX_FRM_PAYLOAD: usize = 222;
+const MAX_FRM_PAYLOAD: usize = 222;
 
 /// A Stream that fits one frame travels whole on this port.
 pub const PORT_STREAM: u8 = 1;
@@ -22,7 +22,7 @@ pub const FIRST: u8 = 0x40;
 /// The fragment is the Stream's last.
 pub const LAST: u8 = 0x80;
 /// What a fragment carries past its flags byte.
-pub const MAX_FRAGMENT: usize = MAX_FRM_PAYLOAD - 1;
+const MAX_FRAGMENT: usize = MAX_FRM_PAYLOAD - 1;
 
 /// The ACK bit in frame control.
 const ACK: u8 = 0x20;
