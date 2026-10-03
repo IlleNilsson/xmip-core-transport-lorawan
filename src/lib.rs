@@ -15,6 +15,18 @@
 //! Location is the device sending up; a Receive Location is the device
 //! taking what comes down.
 //!
+//! **A confirmed frame down is acknowledged after the whole receive
+//! cycle**: on [`transport::Verdict::Accepted`] the device's next frame up
+//! carries its ACK bit; on [`transport::Verdict::Failed`] it does not, and
+//! the network server sends the frame again. `LoRaWAN` has no negative
+//! acknowledgement — the ACK bit is the only answer (`LoRaWAN` L2 1.0.4,
+//! section 4.3.1.2, message acknowledgement) — so nothing tells a network
+//! server *refused, do not send again*: on [`transport::Verdict::Refused`]
+//! the ACK bit rides up too, the frame taken and not sent again, and the
+//! refusal is what the runtime audited. An unconfirmed frame down asks
+//! for no ACK: acceptance is at-most-once there ([`AT_MOST_ONCE`]). Each
+//! Stream arrives whole.
+//!
 //! The radio is a trait: [`LoopbackRadio`] is a gateway and network server
 //! in-process, which every test and every box without a concentrator
 //! drives, the way hart drives its loopback line. The origin URI names the
@@ -26,6 +38,7 @@ pub mod server;
 mod settings;
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -34,7 +47,12 @@ pub use server::NetworkServer;
 use transport::error::{Result, TransportError, protocol_error};
 use transport::held::Held;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::{Arrived, Directions, Transport};
+use transport::{Acknowledgement, Arrived, Directions, Taken, Transport, Verdict};
+
+/// Why an unconfirmed frame down cannot be acknowledged after the receive
+/// cycle.
+pub const AT_MOST_ONCE: &str = "an unconfirmed LoRaWAN frame down asks for no ACK: the network \
+                                server sent it once, in the receive window";
 
 /// Where frames go and come from: the air, as one device hears it.
 pub trait Radio: Send + Sync {
@@ -99,6 +117,9 @@ pub struct Device {
     /// Frames down that carried data as well as an ACK, kept for the next
     /// receive.
     held: Mutex<VecDeque<Frame>>,
+    /// A confirmed frame down was accepted: the next frame up carries its
+    /// ACK bit.
+    ack_due: AtomicBool,
 }
 
 impl Device {
@@ -110,6 +131,7 @@ impl Device {
             fcnt_up: Mutex::new(0),
             fcnt_down: Mutex::new(None),
             held: Mutex::new(VecDeque::new()),
+            ack_due: AtomicBool::new(false),
         }
     }
 
@@ -206,7 +228,10 @@ impl LorawanTransport {
         };
         for (port, payload) in frame::payloads(bytes) {
             let fcnt = self.device.next_fcnt_up();
-            let frame = Frame::new(mtype, self.device.dev_addr, fcnt, port, &payload)?;
+            let mut frame = Frame::new(mtype, self.device.dev_addr, fcnt, port, &payload)?;
+            if self.device.ack_due.swap(false, Ordering::Relaxed) {
+                frame = frame.acknowledging();
+            }
             self.radio.transmit(&frame.seal(&self.device.keys))?;
             if self.confirmed {
                 let down = self
@@ -232,9 +257,13 @@ impl LorawanTransport {
         frame.port == 0 && frame.payload.is_empty()
     }
 
-    /// The next Stream down with a payload — one held from a confirmed send,
-    /// else the next off the radio — or `None` when the windows closed
-    /// empty. A bare ACK carries nothing and is not a Stream.
+    /// The next Stream down with a payload, whole — one held from a
+    /// confirmed send, else the next off the radio — or `None` when the
+    /// windows closed empty. A bare ACK carries nothing and is not a
+    /// Stream. A confirmed frame down is acknowledged by the arrival's
+    /// verdict: accepted, the device's next frame up carries its ACK bit;
+    /// refused, it does not, and the network server sends it again. An
+    /// unconfirmed one is at-most-once ([`AT_MOST_ONCE`]).
     ///
     /// # Errors
     /// Where the radio could not be read or the frame does not open.
@@ -255,7 +284,19 @@ impl LorawanTransport {
                 continue;
             }
             let origin = format!("{}?port={}&fcnt={}", self.origin(), frame.port, frame.fcnt);
-            return Ok(Some(Arrived::new(origin, frame.payload)));
+            let acknowledgement = if frame.mtype == MType::ConfirmedDown {
+                let device = Arc::clone(&self.device);
+                Acknowledgement::deferred(move |verdict| {
+                    // LoRaWAN has no negative acknowledgement: a refused
+                    // frame is acknowledged, taken for good.
+                    let acknowledged = !matches!(verdict, Verdict::Failed);
+                    device.ack_due.store(acknowledged, Ordering::Relaxed);
+                    Ok(())
+                })
+            } else {
+                Acknowledgement::at_most_once(AT_MOST_ONCE)
+            };
+            return Ok(Some(Arrived::whole(origin, frame.payload, acknowledgement)));
         }
         Ok(None)
     }
@@ -270,7 +311,14 @@ impl Transport for LorawanTransport {
         Directions::BOTH
     }
 
-    /// An empty receive window is not an error: an empty vector.
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered("one line or bus, answered in the order it speaks")
+    }
+
+    /// An empty receive window is not an error: an empty vector. A
+    /// confirmed frame down is acknowledged after the receive cycle, by the
+    /// next frame up; an unconfirmed one is at-most-once
+    /// ([`AT_MOST_ONCE`]).
     fn receive(&self) -> Result<Vec<Arrived>> {
         Ok(self.receive_one()?.into_iter().collect())
     }
@@ -318,7 +366,7 @@ impl Loopback for LorawanTransport {
                 .server()
                 .take()
                 .ok_or_else(|| protocol_error("nothing arrived at the network server"))?;
-            Ok(Arrived::new(format!("{origin}?port={port}"), bytes))
+            Ok(Taken::new(format!("{origin}?port={port}"), bytes))
         })))
     }
 
@@ -391,16 +439,91 @@ mod tests {
         loopback
             .send("lorawan://loopback", b"confirmed")
             .expect("sending");
-        let arrived = loopback.receive().expect("receiving");
+        let mut arrived = loopback.receive().expect("receiving");
         assert_eq!(arrived.len(), 1);
-        assert_eq!(arrived[0].bytes, b"set 20");
+        let arrived = arrived.remove(0).taken().expect("taken");
+        assert_eq!(arrived.bytes, b"set 20");
         assert_eq!(
-            arrived[0].origin_uri,
+            arrived.origin_uri,
             "lorawan://loopback/26011b2c?port=3&fcnt=0"
         );
         assert!(
             loopback.receive().expect("quiet again").is_empty(),
             "the ACK rode on the downlink; no bare ACK follows"
+        );
+    }
+
+    /// A radio whose frames down are queued by the test and whose frames up
+    /// are kept for it to read.
+    #[derive(Default)]
+    struct Scripted {
+        down: Mutex<VecDeque<Vec<u8>>>,
+        up: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl Radio for Scripted {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+        fn transmit(&self, frame: &[u8]) -> Result<()> {
+            self.up.lock().expect("up").push(frame.to_vec());
+            Ok(())
+        }
+        fn receive(&self, _timeout: Duration) -> Result<Option<Vec<u8>>> {
+            Ok(self.down.lock().expect("down").pop_front())
+        }
+    }
+
+    #[test]
+    fn a_confirmed_frame_down_is_acknowledged_by_the_next_frame_up_only_when_accepted() {
+        let keys = Keys {
+            nwk_s_key: [3; 16],
+            app_s_key: [4; 16],
+        };
+        let radio = Arc::new(Scripted::default());
+        let device = LorawanTransport::new(
+            Arc::clone(&radio) as Arc<dyn Radio>,
+            Arc::new(Device::new(9, keys)),
+        );
+        let down = |fcnt, mtype| {
+            let frame = Frame::new(mtype, 9, fcnt, 3, b"set 20").expect("frame");
+            radio
+                .down
+                .lock()
+                .expect("down")
+                .push_back(frame.seal(&keys));
+        };
+        let last_up_acknowledges = || {
+            let up = radio.up.lock().expect("up").pop().expect("a frame up");
+            Frame::open(&up, &keys, 0).expect("open").ack
+        };
+        // Failed: the next frame up carries no ACK, so it is sent again.
+        down(0, MType::ConfirmedDown);
+        let first = device.receive().expect("first").remove(0);
+        assert!(first.defers(), "a confirmed frame down waits for its ACK");
+        first.failed().expect("failed");
+        device.send("", b"C1").expect("up");
+        assert!(!last_up_acknowledges(), "failed: no ACK");
+        // Refused: the ACK rides up, so it is not sent again.
+        down(1, MType::ConfirmedDown);
+        let refused = device.receive().expect("refused").remove(0);
+        refused
+            .refused(transport::Refusal::Unacceptable)
+            .expect("acknowledged");
+        device.send("", b"R1").expect("up");
+        assert!(last_up_acknowledges(), "refused: taken for good");
+        // Accepted: the next frame up carries the ACK bit.
+        down(2, MType::ConfirmedDown);
+        let again = device.receive().expect("again").remove(0);
+        assert_eq!(again.taken().expect("accepted").bytes, b"set 20");
+        device.send("", b"C2").expect("up");
+        assert!(last_up_acknowledges(), "accepted: the ACK rides up");
+        // Unconfirmed: nobody waits.
+        down(3, MType::UnconfirmedDown);
+        let unconfirmed = device.receive().expect("unconfirmed").remove(0);
+        assert!(
+            !unconfirmed.defers(),
+            "an unconfirmed frame down is at-most-once"
         );
     }
 
