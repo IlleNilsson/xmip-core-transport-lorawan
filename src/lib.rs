@@ -44,6 +44,7 @@ use std::time::Duration;
 
 pub use frame::{Frame, Keys, MType};
 pub use server::NetworkServer;
+use transport::ArrivalIdentity;
 use transport::error::{Result, TransportError, protocol_error};
 use transport::held::Held;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
@@ -353,6 +354,12 @@ impl LorawanTransport {
 }
 
 impl Loopback for LorawanTransport {
+    fn arrival_identity(&self) -> ArrivalIdentity {
+        ArrivalIdentity::Unnamed(
+            "a downlink is the network server's, and the frame names only this device",
+        )
+    }
+
     /// The network server, holding what arrived whole.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         let radio = self
