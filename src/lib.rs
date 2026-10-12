@@ -316,6 +316,10 @@ impl Transport for LorawanTransport {
         transport::Arrivals::Ordered("one line or bus, answered in the order it speaks")
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Polled("a read of the loopback radio returns at once")
+    }
+
     /// An empty receive window is not an error: an empty vector. A
     /// confirmed frame down is acknowledged after the receive cycle, by the
     /// next frame up; an unconfirmed one is at-most-once
