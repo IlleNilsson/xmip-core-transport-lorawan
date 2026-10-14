@@ -130,6 +130,6 @@ mod tests {
         let cipher = counter(&KEY, &first, &plain);
         assert_ne!(cipher, plain);
         assert_eq!(counter(&KEY, &first, &cipher), plain);
-        assert!(counter(&KEY, &first, &[]).is_empty());
+        assert_eq!(counter(&KEY, &first, &[]), [] as [u8; 0]);
     }
 }
