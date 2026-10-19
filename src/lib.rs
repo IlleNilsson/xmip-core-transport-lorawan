@@ -324,12 +324,17 @@ impl Transport for LorawanTransport {
     /// confirmed frame down is acknowledged after the receive cycle, by the
     /// next frame up; an unconfirmed one is at-most-once
     /// ([`AT_MOST_ONCE`]).
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, _most: usize) -> Result<Vec<Arrived>> {
         Ok(self.receive_one()?.into_iter().collect())
     }
 
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Gathered("one LoRaWAN frame carries the whole body")
+    }
+
     /// The target is the network: a device sends to whoever hears it.
-    fn send(&self, _target: &str, bytes: &[u8]) -> Result<()> {
+    fn send_from(&self, _target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
+        let bytes: &[u8] = &outgoing.gather()?;
         self.send_stream(bytes)
     }
 }
