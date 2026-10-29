@@ -43,6 +43,9 @@ impl Configured for LorawanTransport {
         ],
     };
 
+    /// The schemes a Location's address is entered with to choose this technology.
+    const SCHEMES: &'static [&'static str] = &["lorawan"];
+
     /// No radio is opened from an address yet: the only one is the loopback,
     /// and the session keys a device needs come through the Location's
     /// `credentials`, which this does not read.
