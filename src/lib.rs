@@ -39,8 +39,9 @@ mod settings;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use xcore::lock::Locked;
 
 pub use frame::{Frame, Keys, MType};
 pub use server::NetworkServer;
@@ -88,7 +89,7 @@ impl LoopbackRadio {
 
     /// The network server, to queue a downlink or take what arrived.
     pub fn server(&self) -> std::sync::MutexGuard<'_, NetworkServer> {
-        self.server.lock().unwrap_or_else(PoisonError::into_inner)
+        self.server.locked()
     }
 }
 
@@ -137,7 +138,7 @@ impl Device {
     }
 
     fn next_fcnt_up(&self) -> u32 {
-        let mut fcnt = self.fcnt_up.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut fcnt = self.fcnt_up.locked();
         let next = *fcnt;
         *fcnt += 1;
         next
@@ -197,11 +198,7 @@ impl LorawanTransport {
         let Some(bytes) = self.radio.receive(self.timeout)? else {
             return Ok(None);
         };
-        let mut last = self
-            .device
-            .fcnt_down
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut last = self.device.fcnt_down.locked();
         let expected = last.map_or(0, |n| n + 1);
         let frame = Frame::open(
             &bytes,
@@ -242,11 +239,7 @@ impl LorawanTransport {
                     return Err(protocol_error("a frame down without the ACK bit"));
                 }
                 if !Self::is_bare_ack(&down) {
-                    self.device
-                        .held
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push_back(down);
+                    self.device.held.locked().push_back(down);
                 }
             }
         }
@@ -269,12 +262,7 @@ impl LorawanTransport {
     /// # Errors
     /// Where the radio could not be read or the frame does not open.
     pub fn receive_one(&self) -> Result<Option<Arrived>> {
-        let held = self
-            .device
-            .held
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front();
+        let held = self.device.held.locked().pop_front();
         let mut next = match held {
             Some(frame) => Some(frame),
             None => self.next_down()?,
