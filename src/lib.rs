@@ -49,12 +49,16 @@ use transport::ArrivalIdentity;
 use transport::error::{Result, TransportError, protocol_error};
 use transport::held::Held;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::{Acknowledgement, Arrived, Directions, Taken, Transport, Verdict};
+use transport::{Acknowledgement, Arrived, Configured, Directions, Taken, Transport, Verdict};
 
 /// Why an unconfirmed frame down cannot be acknowledged after the receive
 /// cycle.
 pub const AT_MOST_ONCE: &str = "an unconfirmed LoRaWAN frame down asks for no ACK: the network \
                                 server sent it once, in the receive window";
+
+/// How long the receive windows are waited on before they close empty
+/// unless a Location says.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where frames go and come from: the air, as one device hears it.
 pub trait Radio: Send + Sync {
@@ -164,7 +168,7 @@ impl LorawanTransport {
             radio,
             device,
             confirmed: false,
-            timeout: Duration::from_secs(5),
+            timeout: DEFAULT_TIMEOUT,
             loopback: None,
         }
     }
@@ -173,13 +177,6 @@ impl LorawanTransport {
     #[must_use]
     pub const fn confirmed(mut self) -> Self {
         self.confirmed = true;
-        self
-    }
-
-    /// Give up on a receive window that stays empty for `timeout`.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
         self
     }
 

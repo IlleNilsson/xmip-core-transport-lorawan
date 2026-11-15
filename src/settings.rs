@@ -7,7 +7,7 @@ use transport::Configured;
 use transport::error::{Result, TransportError};
 use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
-use crate::{Device, Keys, LorawanTransport, Radio};
+use crate::{DEFAULT_TIMEOUT, Device, Keys, LorawanTransport, Radio};
 
 impl Configured for LorawanTransport {
     /// The address is the radio the device is heard through, a concentrator;
@@ -33,18 +33,20 @@ impl Configured for LorawanTransport {
                 meaning: "Whether every frame up waits for its acknowledgement down.",
                 applies: Applies::Send,
             },
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Optional,
-                meaning: "How long the receive windows are waited on before they close empty.",
-                applies: Applies::Both,
-            },
+            transport::configured::timeout(
+                Applies::Both,
+                Some(DEFAULT_TIMEOUT),
+                "How long the receive windows are waited on before they close empty.",
+            ),
         ],
     };
 
     /// The schemes a Location's address is entered with to choose this technology.
     const SCHEMES: &'static [&'static str] = &["lorawan"];
+
+    fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
+        Some(&mut self.timeout)
+    }
 
     /// No radio is opened from an address yet: the only one is the loopback,
     /// and the session keys a device needs come through the Location's
@@ -59,7 +61,9 @@ impl Configured for LorawanTransport {
 impl LorawanTransport {
     /// The device with `keys` on `radio`, as the settings read say: what
     /// [`Configured::configured`] builds once a radio opens from an address
-    /// and the keys come through the Location's `credentials`.
+    /// and the keys come through the Location's `credentials`. The
+    /// Location's timeout is not read here: [`Configured::open`] hands it
+    /// on once the device is built.
     #[must_use]
     pub fn on(radio: Arc<dyn Radio>, keys: Keys, settings: &Read) -> Self {
         // The declaration holds it within 32 bits.
@@ -68,10 +72,7 @@ impl LorawanTransport {
         if settings.optional_boolean("confirmed") == Some(true) {
             transport = transport.confirmed();
         }
-        match settings.optional_duration("timeout") {
-            Some(timeout) => transport.timing_out_after(timeout),
-            None => transport,
-        }
+        transport
     }
 }
 
@@ -101,7 +102,20 @@ mod tests {
         let device = LorawanTransport::on(radio, keys, &read);
         assert_eq!(device.device.dev_addr, 0x2601_1b2c);
         assert!(device.confirmed);
-        assert_eq!(device.timeout, Duration::from_secs(3));
+        // No radio opens from an address yet, so no Location reaches the
+        // device: the timeout is read for `Configured::open` to hand on.
+        assert_eq!(
+            read.optional_duration(transport::configured::TIMEOUT),
+            Some(Duration::from_secs(3))
+        );
+        // Left out, the Location waits the default it declares, which the
+        // device waits until `open` hands it another.
+        let unsaid = declared.read(Applies::Send, &given[..1]).expect("read");
+        assert_eq!(
+            unsaid.optional_duration(transport::configured::TIMEOUT),
+            Some(DEFAULT_TIMEOUT)
+        );
+        assert_eq!(device.timeout, DEFAULT_TIMEOUT);
 
         let Err(refused) = LorawanTransport::open("gateway", Applies::Receive, &given) else {
             panic!("a Receive Location sends nothing confirmed");
