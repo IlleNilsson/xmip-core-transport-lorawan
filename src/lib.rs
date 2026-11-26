@@ -31,89 +31,67 @@
 //! in-process, which every test and every box without a concentrator
 //! drives, the way hart drives its loopback line. The origin URI names the
 //! radio, the device and the port: `lorawan://loopback/26011b2c?port=2`.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, wherever it
+//! is built, and none of the code above, which is behind the default
+//! feature: what the surfaces' library carries (ADR-0064, amendment
+//! 2026-11-26). The wait a Location takes unless it says,
+//! `DEFAULT_TIMEOUT`, is declared there with it.
 
+#[cfg(feature = "default")]
 pub mod aes;
+#[cfg(feature = "default")]
+mod configured;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 pub mod frame;
+#[cfg(feature = "default")]
+mod radio;
+#[cfg(feature = "default")]
 pub mod server;
-mod settings;
 
+#[cfg(feature = "default")]
 use std::collections::VecDeque;
+#[cfg(feature = "default")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "default")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "default")]
 use std::time::Duration;
+#[cfg(feature = "default")]
 use xcore::lock::Locked;
 
+#[cfg(feature = "default")]
+use declaration::DEFAULT_TIMEOUT;
+#[cfg(feature = "default")]
 pub use frame::{Frame, Keys, MType};
+#[cfg(feature = "default")]
+pub use radio::{LoopbackRadio, Radio};
+#[cfg(feature = "default")]
 pub use server::NetworkServer;
+#[cfg(feature = "default")]
 use transport::ArrivalIdentity;
+#[cfg(feature = "default")]
 use transport::error::{Result, TransportError, protocol_error};
+#[cfg(feature = "default")]
 use transport::held::Held;
+#[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
+#[cfg(feature = "default")]
 use transport::{Acknowledgement, Arrived, Configured, Directions, Taken, Transport, Verdict};
 
 /// Why an unconfirmed frame down cannot be acknowledged after the receive
 /// cycle.
+#[cfg(feature = "default")]
 pub const AT_MOST_ONCE: &str = "an unconfirmed LoRaWAN frame down asks for no ACK: the network \
                                 server sent it once, in the receive window";
-
-/// How long the receive windows are waited on before they close empty
-/// unless a Location says.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Where frames go and come from: the air, as one device hears it.
-pub trait Radio: Send + Sync {
-    /// The radio's name, for the origin URI.
-    fn name(&self) -> &str;
-    /// Send a sealed frame up.
-    ///
-    /// # Errors
-    /// Where the radio refused it.
-    fn transmit(&self, frame: &[u8]) -> Result<()>;
-    /// The next sealed frame down, or `None` when nothing came within
-    /// `timeout` — the receive windows closed empty.
-    ///
-    /// # Errors
-    /// Where the radio could not be read.
-    fn receive(&self, timeout: Duration) -> Result<Option<Vec<u8>>>;
-}
-
-/// A gateway and network server in-process: what the device sends up the
-/// server opens, and what the server queues down the device receives next.
-pub struct LoopbackRadio {
-    server: Mutex<NetworkServer>,
-}
-
-impl LoopbackRadio {
-    #[must_use]
-    pub const fn new(server: NetworkServer) -> Self {
-        Self {
-            server: Mutex::new(server),
-        }
-    }
-
-    /// The network server, to queue a downlink or take what arrived.
-    pub fn server(&self) -> std::sync::MutexGuard<'_, NetworkServer> {
-        self.server.locked()
-    }
-}
-
-impl Radio for LoopbackRadio {
-    fn name(&self) -> &'static str {
-        "loopback"
-    }
-
-    fn transmit(&self, frame: &[u8]) -> Result<()> {
-        self.server().uplink(frame)
-    }
-
-    fn receive(&self, _timeout: Duration) -> Result<Option<Vec<u8>>> {
-        Ok(self.server().next_downlink())
-    }
-}
 
 /// The device's session: its address, its keys and where its counter is.
 /// Shared by every clone of a transport, because the network refuses a
 /// counter that goes back.
+#[cfg(feature = "default")]
 #[derive(Debug)]
 pub struct Device {
     pub dev_addr: u32,
@@ -128,6 +106,7 @@ pub struct Device {
     ack_due: AtomicBool,
 }
 
+#[cfg(feature = "default")]
 impl Device {
     #[must_use]
     pub const fn new(dev_addr: u32, keys: Keys) -> Self {
@@ -150,6 +129,7 @@ impl Device {
 }
 
 /// One device on one radio.
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct LorawanTransport {
     radio: Arc<dyn Radio>,
@@ -160,6 +140,7 @@ pub struct LorawanTransport {
     loopback: Option<Arc<LoopbackRadio>>,
 }
 
+#[cfg(feature = "default")]
 impl LorawanTransport {
     /// `device` on `radio`, sending unconfirmed.
     #[must_use]
@@ -288,6 +269,7 @@ impl LorawanTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for LorawanTransport {
     fn name(&self) -> &'static str {
         "lorawan"
@@ -324,6 +306,7 @@ impl Transport for LorawanTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl LorawanTransport {
     /// Both ends on one in-process radio: a device sending confirmed, and
     /// the network server that opens and acknowledges what it sends, the
@@ -347,6 +330,7 @@ impl LorawanTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Loopback for LorawanTransport {
     fn arrival_identity(&self) -> ArrivalIdentity {
         ArrivalIdentity::Unnamed(

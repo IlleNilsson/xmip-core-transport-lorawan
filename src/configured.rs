@@ -1,48 +1,19 @@
-//! What a `LoRaWAN` Location says beyond its address, declared once and read
-//! through (ADR-0064, amendment 2026-09-26).
+//! How a `LoRaWAN` Location is configured: `Configured`, reading what it
+//! says beyond its address, which its [`declaration`](crate::declaration)
+//! declares once (ADR-0064, amendments 2026-09-26 and 2026-11-26), and the
+//! device built from what was read.
 
 use std::sync::Arc;
 
 use transport::Configured;
 use transport::error::{Result, TransportError};
-use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
+use xcore::settings::{Read, Settings};
 
-use crate::{DEFAULT_TIMEOUT, Device, Keys, LorawanTransport, Radio};
+use crate::{Device, Keys, LorawanTransport, Radio, declaration};
 
 impl Configured for LorawanTransport {
-    /// The address is the radio the device is heard through, a concentrator;
-    /// the settings are the device's session and how it sends. The session
-    /// keys are secrets and come through the Location's `credentials`.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "dev_addr",
-                kind: Kind::Integer {
-                    minimum: 0,
-                    maximum: u32::MAX as i64,
-                },
-                presence: Presence::Required,
-                meaning: "The device address the network gave this device's session.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "confirmed",
-                kind: Kind::Boolean,
-                presence: Presence::Optional,
-                meaning: "Whether every frame up waits for its acknowledgement down.",
-                applies: Applies::Send,
-            },
-            transport::configured::timeout(
-                Applies::Both,
-                Some(DEFAULT_TIMEOUT),
-                "How long the receive windows are waited on before they close empty.",
-            ),
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["lorawan"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
         Some(&mut self.timeout)
@@ -79,9 +50,10 @@ impl LorawanTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::declaration::DEFAULT_TIMEOUT;
     use crate::{LoopbackRadio, NetworkServer};
     use std::time::Duration;
-    use xcore::settings::Given;
+    use xcore::settings::{Applies, Given};
 
     #[test]
     fn lorawan_declares_its_settings_and_reads_through_them() {
