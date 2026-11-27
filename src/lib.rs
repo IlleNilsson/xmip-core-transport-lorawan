@@ -37,13 +37,10 @@
 //! packet forwarder of this crate's own (`forwarder.rs`), which needs no
 //! radio: the loopback stands both ends on this machine, over UDP.
 //!
-//! **Built with its `declaration` feature alone** the crate is
-//! `declaration`, what a Location of it is configured with, wherever it is
-//! built, and none of the code above, which is behind the default feature:
-//! what the surfaces' library carries (ADR-0064, amendment 2026-11-26).
-//! The wait a Location takes unless it says, `DEFAULT_TIMEOUT`, and the
-//! port an address that names none listens on, `PORT`, are declared there
-//! with it.
+//! **Built with its `declaration` feature alone** the crate is `declaration`.
+//! It is the same wherever it is built. The wait a Location takes unless it
+//! says, `DEFAULT_TIMEOUT`, and the port an address that names none listens
+//! on, `PORT`, are declared there with it.
 
 #[cfg(feature = "default")]
 pub mod aes;
