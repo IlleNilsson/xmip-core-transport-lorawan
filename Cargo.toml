@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/IlleNilsson/xmip-core-transport-lorawan"
-description = "LoRaWAN transport: the MAC frame — confirmed and unconfirmed data up and down, the frame counter, the FRMPayload under AES-128 and the CMAC MIC — a Stream longer than one frame travels as fragments on its own port; a loopback radio and network server stand in for the gateway. A xmip-core-transport technology."
+description = "LoRaWAN transport: a node is the network server its gateways point at over Semtech's UDP packet forwarder protocol, version 2; the MAC frame both ways, confirmed or not, its FRMPayload under AES-128 and CMAC MIC, a long Stream in fragments; a packet forwarder and a device of its own stand in for gateway and radio. A xmip-core-transport technology."
 publish = false
 
 [lib]
@@ -12,32 +12,47 @@ path = "src/lib.rs"
 
 [dependencies]
 # A Technology depends on its parent Capability, never the reverse
-# (repository-model.md). The framing is bytes and the loopback is in this
-# process. Its declaration takes the capability's `timeout`
+# (repository-model.md): the datagram socket a node listens on for its
+# gateways (`transport::socket`), what the Locations of a node share
+# (`transport::sharing`), and the secret holding a session's keys
+# (`transport::secured`). Its declaration takes the capability's `timeout`
 # (`transport::configured::timeout`).
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
 # AES-128 and its CMAC, which every LoRaWAN key drives (aes.rs):
 # RustCrypto's, constant-time, the aes the estate's SFTP and Kerberos take.
 aes = { version = "0.9", optional = true }
 cmac = { version = "0.8", optional = true }
+# A PHY payload travels in the protocol's JSON as base 64, and a session's
+# keys are written in hexadecimal: the estate's one codec for both.
+codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main", optional = true }
+# The port an address that names none listens on
+# (`net::authority::with_default_port`).
+net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main", optional = true }
+# The packet forwarder protocol carries `rxpk`, `txpk` and `txpk_ack` as
+# JSON, and serde reads and writes it, as the estate's other transports
+# that speak JSON do.
+serde_json = { version = "1", optional = true }
 # The settings this technology declares (xcore::settings), read through
-# transport::Configured (ADR-0064, amendment 2026-09-26).
+# transport::Configured (ADR-0064, amendment 2026-09-26); the lock and the
+# wake the Locations sharing a node's gateways wait on (xcore::lock,
+# xcore::wake).
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
 
 [features]
 # The technology: its code, everything it is built on, and its declaration.
 # Without it the crate is its declaration alone (ADR-0064, amendments
 # 2026-10-22 and 2026-11-26).
-default = ["declaration", "dep:aes", "dep:cmac"]
+default = ["declaration", "dep:aes", "dep:cmac", "dep:codec", "dep:net", "dep:serde_json"]
 # The declaration alone: what a Location of this technology is configured
 # with, `declaration::SETTINGS` and `SCHEMES`, with the wait a Location
-# takes unless it says, and none of the code — what the surfaces' library
-# is to carry (open problem 48).
+# takes unless it says and the port an address that names none listens on,
+# and none of the code — what the surfaces' library is to carry (open
+# problem 48).
 declaration = []
 
 [dev-dependencies]
-# The loopback payloads the tests drive, from the capability's test
-# support and never a production build (ADR-0044).
+# The loopback payloads the tests drive and the secrets a test keeps, from
+# the capability's test support and never a production build (ADR-0044).
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main", features = ["test-support"] }
 
 [lints.rust]

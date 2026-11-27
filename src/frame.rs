@@ -1,39 +1,69 @@
 //! The `LoRaWAN` MAC frame as the air carries it: a MAC header naming the
 //! message type, the frame header — device address, frame control, frame
-//! counter — a port, the `FRMPayload` under the application session key, and
-//! the four-byte MIC under the network session key.
+//! counter, frame options — a port, the `FRMPayload` under a session key,
+//! and the four-byte MIC under the network session key.
+//!
+//! What a real device sends is opened whole: a frame with no `FRMPayload`
+//! carries no port, its options — MAC commands, which this crate answers
+//! none of — are skipped under the MIC that covers them, and a payload on
+//! port 0, MAC commands too, is under the network session key, as the
+//! specification has it (`LoRaWAN` L2 1.0.4, section 4.3).
 
-use transport::error::{Result, protocol_error};
+use transport::error::{Result, TransportError, protocol_error};
 
 use crate::aes::{self, BLOCK};
 
 /// The most `FRMPayload` one frame carries: N for the fastest EU868 data rate
 /// (DR5, 230 bytes of `MACPayload` less the frame header and port). A slower
 /// data rate carries less; the specification's tables say how much.
-const MAX_FRM_PAYLOAD: usize = 222;
-
-/// A Stream that fits one frame travels whole on this port.
-pub const PORT_STREAM: u8 = 1;
-/// A Stream longer than one frame travels in fragments on this port, each
-/// opening with a flags byte: [`FIRST`], [`LAST`], both or neither.
-pub const PORT_FRAGMENT: u8 = 2;
-/// The fragment is the Stream's first.
-pub const FIRST: u8 = 0x40;
-/// The fragment is the Stream's last.
-pub const LAST: u8 = 0x80;
-/// What a fragment carries past its flags byte.
-const MAX_FRAGMENT: usize = MAX_FRM_PAYLOAD - 1;
+pub const MAX_FRM_PAYLOAD: usize = 222;
 
 /// The ACK bit in frame control.
 const ACK: u8 = 0x20;
 /// The frame-options length is the low four bits of frame control.
 const FOPTS_LEN: u8 = 0x0f;
+/// The MAC header and the frame header without its options: what every
+/// data frame opens with.
+const HEAD: usize = 8;
+/// The MIC every frame ends with.
+const MIC: usize = 4;
 
 /// The session keys a device and its network share.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Keys {
     pub nwk_s_key: [u8; BLOCK],
     pub app_s_key: [u8; BLOCK],
+}
+
+impl Keys {
+    /// The keys `text` holds: 64 hexadecimal digits, the network session
+    /// key's 32 and then the application session key's, each most
+    /// significant byte first, as a network server shows them — what the
+    /// secret a Location names holds (ADR-0051, amendment 2026-11-27).
+    ///
+    /// # Errors
+    /// Permanent where `text` is not 64 hexadecimal digits, saying what
+    /// it is to hold.
+    pub fn from_hex(text: &str) -> Result<Self> {
+        let refused = || {
+            TransportError::permanent(
+                "a LoRaWAN session's keys are 64 hexadecimal digits, the network session key's \
+                 32 and then the application session key's, in the secret its Location names",
+            )
+        };
+        let bytes = codec::hex::decode(text.trim()).map_err(|_| refused())?;
+        let (nwk, app) = bytes.split_at_checked(BLOCK).ok_or_else(refused)?;
+        Ok(Self {
+            nwk_s_key: nwk.try_into().map_err(|_| refused())?,
+            app_s_key: app.try_into().map_err(|_| refused())?,
+        })
+    }
+
+    /// The keys as [`Keys::from_hex`] reads them.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        codec::hex::encode(&[self.nwk_s_key, self.app_s_key].concat())
+    }
 }
 
 /// The message type in the MAC header.
@@ -88,6 +118,7 @@ pub struct Frame {
     pub ack: bool,
     /// The full 32-bit counter; the air carries its low sixteen bits.
     pub fcnt: u32,
+    /// The port, 0 where the frame carries none.
     pub port: u8,
     pub payload: Vec<u8>,
 }
@@ -117,6 +148,22 @@ impl Frame {
         self
     }
 
+    /// Whether the frame carries no port: nothing on port 0, which the air
+    /// carries as no port and no payload — a bare acknowledgement.
+    fn bare(&self) -> bool {
+        self.port == 0 && self.payload.is_empty()
+    }
+
+    /// The key its `FRMPayload` is under: the network session key on port
+    /// 0, MAC commands, and the application session key on every other.
+    const fn payload_key(&self, keys: &Keys) -> [u8; BLOCK] {
+        if self.port == 0 {
+            keys.nwk_s_key
+        } else {
+            keys.app_s_key
+        }
+    }
+
     /// The block every MIC and key stream opens with: a leading byte, four
     /// zeros, the direction, the device address, the full counter, a zero.
     fn block(&self, leading: u8, last: u8) -> [u8; BLOCK] {
@@ -135,8 +182,20 @@ impl Frame {
         out.extend_from_slice(&self.dev_addr.to_le_bytes());
         out.push(if self.ack { ACK } else { 0 });
         out.extend_from_slice(&u16::try_from(self.fcnt & 0xffff).unwrap_or(0).to_le_bytes());
-        out.push(self.port);
+        if !self.bare() {
+            out.push(self.port);
+        }
         out
+    }
+
+    /// What the MIC is the CMAC of: its block, then `body`, what precedes
+    /// the MIC on the air.
+    fn covered(&self, body: &[u8]) -> Vec<u8> {
+        let mut covered = self
+            .block(0x49, u8::try_from(body.len()).unwrap_or(u8::MAX))
+            .to_vec();
+        covered.extend_from_slice(body);
+        covered
     }
 
     /// The frame as the air carries it: payload encrypted, MIC appended.
@@ -144,35 +203,32 @@ impl Frame {
     pub fn seal(&self, keys: &Keys) -> Vec<u8> {
         let mut out = self.head();
         out.extend(aes::counter(
-            &keys.app_s_key,
+            &self.payload_key(keys),
             &self.block(0x01, 0),
             &self.payload,
         ));
-        let mut covered = self
-            .block(0x49, u8::try_from(out.len()).unwrap_or(u8::MAX))
-            .to_vec();
-        covered.extend_from_slice(&out);
-        out.extend_from_slice(&aes::cmac(&keys.nwk_s_key, &covered)[..4]);
+        let covered = self.covered(&out);
+        out.extend_from_slice(&aes::cmac(&keys.nwk_s_key, &covered)[..MIC]);
         out
     }
 
     /// The frame `bytes` carry, MIC checked and payload decrypted, given the
-    /// high sixteen bits of the counter the air does not carry.
+    /// high sixteen bits of the counter the air does not carry; its options
+    /// skipped.
     ///
     /// # Errors
-    /// A frame cut off, a message type this crate does not carry, frame
-    /// options (which this crate does not carry), or a MIC that does not
-    /// check — a frame under another key, or tampered with.
+    /// A frame cut off, a message type this crate does not carry, or a MIC
+    /// that does not check — a frame under another key, or tampered with.
     pub fn open(bytes: &[u8], keys: &Keys, fcnt_high: u16) -> Result<Self> {
-        let cut = || protocol_error("a frame cut off before its MIC");
-        if bytes.len() < 13 {
-            return Err(cut());
+        if bytes.len() < HEAD + MIC {
+            return Err(protocol_error("a frame cut off before its MIC"));
         }
-        let (body, mic) = bytes.split_at(bytes.len() - 4);
+        let (body, mic) = bytes.split_at(bytes.len() - MIC);
         let mtype = MType::from_bits(body[0] >> 5)?;
         let fctrl = body[5];
-        if fctrl & FOPTS_LEN != 0 {
-            return Err(protocol_error("frame options this crate does not carry"));
+        let options = HEAD + usize::from(fctrl & FOPTS_LEN);
+        if body.len() < options {
+            return Err(protocol_error("a frame cut off inside its options"));
         }
         let fcnt = u32::from(fcnt_high) << 16 | u32::from(u16::from_le_bytes([body[6], body[7]]));
         let mut frame = Self {
@@ -180,42 +236,29 @@ impl Frame {
             dev_addr: u32::from_le_bytes([body[1], body[2], body[3], body[4]]),
             ack: fctrl & ACK != 0,
             fcnt,
-            port: body[8],
+            port: body.get(options).copied().unwrap_or(0),
             payload: Vec::new(),
         };
-        let mut covered = frame
-            .block(0x49, u8::try_from(body.len()).unwrap_or(u8::MAX))
-            .to_vec();
-        covered.extend_from_slice(body);
-        if !aes::verifies(&keys.nwk_s_key, &covered, mic) {
+        if !aes::verifies(&keys.nwk_s_key, &frame.covered(body), mic) {
             return Err(protocol_error("a MIC that does not check"));
         }
-        frame.payload = aes::counter(&keys.app_s_key, &frame.block(0x01, 0), &body[9..]);
+        if let Some(sealed) = body.get(options + 1..) {
+            frame.payload = aes::counter(&frame.payload_key(keys), &frame.block(0x01, 0), sealed);
+        }
         Ok(frame)
     }
 }
 
-/// `bytes` as the frame payloads that carry it: one on [`PORT_STREAM`] where it
-/// fits, else fragments on [`PORT_FRAGMENT`], each flagged first, last, both
-/// or neither.
+/// The device a data frame names, read before it is opened: how a network
+/// server tells whose session opens what a gateway heard. `None` for what
+/// is no data frame this crate carries.
 #[must_use]
-pub fn payloads(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
-    if bytes.len() <= MAX_FRM_PAYLOAD {
-        return vec![(PORT_STREAM, bytes.to_vec())];
+pub fn dev_addr_of(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < HEAD + MIC {
+        return None;
     }
-    let count = bytes.len().div_ceil(MAX_FRAGMENT);
-    bytes
-        .chunks(MAX_FRAGMENT)
-        .enumerate()
-        .map(|(index, chunk)| {
-            let flags =
-                if index == 0 { FIRST } else { 0 } | if index + 1 == count { LAST } else { 0 };
-            let mut out = Vec::with_capacity(chunk.len() + 1);
-            out.push(flags);
-            out.extend_from_slice(chunk);
-            (PORT_FRAGMENT, out)
-        })
-        .collect()
+    MType::from_bits(bytes[0] >> 5).ok()?;
+    Some(u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]))
 }
 
 #[cfg(test)]
@@ -244,6 +287,7 @@ mod tests {
         assert_eq!(bytes.len(), 9 + 6 + 4);
         assert_ne!(&bytes[9..15], b"21.5 C", "encrypted");
         assert_eq!(Frame::open(&bytes, &keys(), 1).expect("open"), frame);
+        assert_eq!(dev_addr_of(&bytes), Some(0x2601_1b2c));
         assert!(
             Frame::open(&bytes, &keys(), 0).is_err(),
             "the wrong high bits"
@@ -264,40 +308,80 @@ mod tests {
         let bytes = frame.acknowledging().seal(&keys());
         assert_eq!(bytes[5], ACK);
         assert!(Frame::open(&bytes, &keys(), 0).expect("open").ack);
-        assert!(Frame::open(&bytes[..12], &keys(), 0).is_err(), "cut off");
+        assert!(Frame::open(&bytes[..11], &keys(), 0).is_err(), "cut off");
         let mut bad = bytes.clone();
         bad[bytes.len() - 1] ^= 1;
         assert!(Frame::open(&bad, &keys(), 0).is_err(), "MIC");
-        let mut join = bytes.clone();
+        let mut join = bytes;
         join[0] = 0x00;
         assert!(Frame::open(&join, &keys(), 0).is_err(), "a join request");
-        let mut options = bytes;
-        options[5] |= 2;
-        assert!(Frame::open(&options, &keys(), 0).is_err(), "frame options");
+        assert_eq!(dev_addr_of(&join), None, "no data frame");
         assert!(Frame::new(MType::UnconfirmedUp, 1, 0, 1, &[0; 223]).is_err());
         assert!(Frame::new(MType::UnconfirmedUp, 1, 0, 1, &[0; 222]).is_ok());
     }
 
     #[test]
-    fn a_stream_travels_whole_where_it_fits_and_in_flagged_fragments_beyond() {
-        let short = payloads(&[7; 222]);
-        assert_eq!(short, vec![(PORT_STREAM, vec![7; 222])]);
-        assert_eq!(payloads(&[]), vec![(PORT_STREAM, Vec::new())]);
-        let long: Vec<u8> = (0..500u32)
-            .map(|n| u8::try_from(n % 256).unwrap_or(0))
-            .collect();
-        let fragments = payloads(&long);
-        assert_eq!(fragments.len(), 3);
-        assert_eq!(fragments[0].0, PORT_FRAGMENT);
-        assert_eq!(fragments[0].1[0], FIRST);
-        assert_eq!(fragments[1].1[0], 0);
-        assert_eq!(fragments[2].1[0], LAST);
-        assert_eq!(fragments[2].1.len(), 1 + 500 - 2 * MAX_FRAGMENT);
-        let joined: Vec<u8> = fragments
-            .iter()
-            .flat_map(|(_, f)| f[1..].to_vec())
-            .collect();
-        assert_eq!(joined, long);
-        assert!(MType::ConfirmedDown.is_confirmed() && !MType::ConfirmedDown.is_uplink());
+    fn a_bare_acknowledgement_carries_no_port_and_options_are_skipped() {
+        let bare = Frame::new(MType::UnconfirmedUp, 9, 3, 0, b"")
+            .expect("frame")
+            .acknowledging();
+        let bytes = bare.seal(&keys());
+        assert_eq!(bytes.len(), HEAD + MIC, "no port, no payload");
+        assert_eq!(Frame::open(&bytes, &keys(), 0).expect("open"), bare);
+
+        // A device's frame with two bytes of options, a LinkCheckReq and a
+        // DeviceTimeReq, and three of payload on port 5, sealed as a device
+        // seals it: the options are covered by the MIC and skipped.
+        let sent = Frame::new(MType::UnconfirmedUp, 9, 4, 5, b"abc").expect("frame");
+        let mut body = sent.head();
+        body[5] |= 2;
+        let port = body.split_off(HEAD);
+        body.extend([0x02, 0x0d]);
+        body.extend(port);
+        body.extend(aes::counter(
+            &keys().app_s_key,
+            &sent.block(0x01, 0),
+            b"abc",
+        ));
+        let covered = sent.covered(&body);
+        body.extend_from_slice(&aes::cmac(&keys().nwk_s_key, &covered)[..MIC]);
+        let opened = Frame::open(&body, &keys(), 0).expect("options skipped");
+        assert_eq!((opened.port, opened.payload.as_slice()), (5, &b"abc"[..]));
+        let cut = Frame::open(&body[..HEAD + MIC], &keys(), 0).expect_err("cut");
+        assert!(cut.message.contains("options"), "{cut}");
+    }
+
+    #[test]
+    fn port_zero_is_under_the_network_key() {
+        let commands = Frame::new(MType::UnconfirmedDown, 9, 0, 0, &[0x02]).expect("frame");
+        let bytes = commands.seal(&keys());
+        let under_app = aes::counter(&keys().app_s_key, &commands.block(0x01, 0), &[0x02]);
+        assert_ne!(bytes[9..10], under_app[..], "not the application key");
+        assert_eq!(Frame::open(&bytes, &keys(), 0).expect("open"), commands);
+    }
+
+    #[test]
+    fn the_keys_read_from_and_write_to_64_hexadecimal_digits() {
+        let text = format!("{}{}", "11".repeat(16), "22".repeat(16));
+        let read = Keys::from_hex(&text).expect("keys");
+        assert_eq!(read, keys());
+        assert_eq!(read.to_hex(), text);
+        assert_eq!(
+            Keys::from_hex(&format!(" {text}\n")).expect("trimmed"),
+            keys()
+        );
+        for wrong in [
+            "",
+            "11",
+            &text[..62],
+            &format!("{text}00"),
+            &text.replace('1', "g"),
+        ] {
+            let refused = Keys::from_hex(wrong).expect_err(wrong);
+            assert!(
+                !refused.retryable && refused.message.contains("64"),
+                "{refused}"
+            );
+        }
     }
 }

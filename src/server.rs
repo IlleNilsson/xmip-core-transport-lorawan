@@ -1,57 +1,81 @@
 //! The network server's side of one device: it opens each uplink under the
-//! device's session keys, refuses a counter that does not advance, puts the
-//! fragments of a Stream back together, and answers a confirmed uplink with
-//! a downlink carrying the ACK bit. The same server runs inside the loopback
-//! radio; behind a real gateway it is the operator's.
+//! device's session keys, takes the same frame heard by a second gateway
+//! once, refuses a counter that does not advance, puts the fragments of a
+//! Stream back together, answers a confirmed uplink with a frame carrying
+//! the ACK bit, and seals each downlink with its own counter. A node is it
+//! behind the gateways that point at it (`gateways.rs`); the keys are handed
+//! in at each use, as the secret holding them is read then.
 
 use std::collections::VecDeque;
 
 use transport::error::{Result, protocol_error};
 
-use crate::frame::{self, Frame, Keys, MType};
+use crate::fragment::{PORT_COMMANDS, Reassembly};
+use crate::frame::{Frame, Keys, MType};
 
 /// One device as its network server knows it.
 #[derive(Debug)]
 pub struct NetworkServer {
     dev_addr: u32,
-    keys: Keys,
-    /// The last uplink counter accepted, or `None` before the first.
+    /// The last uplink counter taken, or `None` before the first.
     fcnt_up: Option<u32>,
+    /// The last uplink taken, as the air carried it: the same frame another
+    /// gateway heard is not taken again.
+    last_up: Vec<u8>,
     fcnt_down: u32,
-    arriving: Vec<u8>,
-    complete: VecDeque<(u8, Vec<u8>)>,
-    /// Queued for the device's receive windows, sealed when they open: a
-    /// confirmed uplink puts its ACK on the first of them.
-    downlinks: VecDeque<Frame>,
+    arriving: Reassembly,
+    complete: VecDeque<Whole>,
+}
+
+/// A Stream that arrived whole: the port and the counter of its last frame.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Whole {
+    pub port: u8,
+    pub fcnt: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// What one uplink was, beyond the Stream it may have made whole.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Uplink {
+    /// It acknowledged the last confirmed frame down.
+    pub ack: bool,
+    /// The frame acknowledging it, sealed, where it was confirmed: for the
+    /// device's first receive window.
+    pub answer: Option<Vec<u8>>,
 }
 
 impl NetworkServer {
     #[must_use]
-    pub const fn new(dev_addr: u32, keys: Keys) -> Self {
+    pub const fn new(dev_addr: u32) -> Self {
         Self {
             dev_addr,
-            keys,
             fcnt_up: None,
+            last_up: Vec::new(),
             fcnt_down: 0,
-            arriving: Vec::new(),
+            arriving: Reassembly::new(),
             complete: VecDeque::new(),
-            downlinks: VecDeque::new(),
         }
     }
 
-    /// One uplink as the gateway forwarded it.
+    /// One uplink as a gateway forwarded it, opened under `keys`: `None`
+    /// where it is the frame taken last, heard again by another gateway, or
+    /// no frame of this session's — one that does not open under its keys,
+    /// as another network's device at the same address sends, for a device
+    /// address is unique within one network alone.
     ///
     /// # Errors
-    /// A frame that does not open, from another device, going the wrong way,
-    /// with a counter that does not advance, or on a port this crate does
-    /// not carry.
-    pub fn uplink(&mut self, bytes: &[u8]) -> Result<()> {
+    /// A frame from another device, going the wrong way, with a counter
+    /// that does not advance, or on a port this crate does not carry.
+    pub fn uplink(&mut self, bytes: &[u8], keys: &Keys) -> Result<Option<Uplink>> {
+        if bytes == self.last_up.as_slice() {
+            return Ok(None);
+        }
         let expected = self.fcnt_up.map_or(0, |last| last + 1);
-        let frame = Frame::open(
-            bytes,
-            &self.keys,
-            u16::try_from(expected >> 16).unwrap_or(0),
-        )?;
+        let high = u16::try_from(expected >> 16).unwrap_or(0);
+        let Ok(frame) = Frame::open(bytes, keys, high) else {
+            return Ok(None);
+        };
         if frame.dev_addr != self.dev_addr {
             return Err(protocol_error("an uplink from another device"));
         }
@@ -61,76 +85,51 @@ impl NetworkServer {
         if self.fcnt_up.is_some_and(|last| frame.fcnt <= last) {
             return Err(protocol_error("a frame counter that did not advance"));
         }
-        match frame.port {
-            frame::PORT_STREAM => self.complete.push_back((frame.port, frame.payload.clone())),
-            frame::PORT_FRAGMENT => self.fragment(&frame.payload)?,
-            other => {
-                return Err(protocol_error(format!(
-                    "port {other}, which nothing listens on"
-                )));
-            }
+        let (port, fcnt, ack) = (frame.port, frame.fcnt, frame.ack);
+        if let Some(bytes) = self.arriving.arrived(port, frame.payload)? {
+            self.complete.push_back(Whole { port, fcnt, bytes });
         }
-        self.fcnt_up = Some(frame.fcnt);
-        if frame.mtype.is_confirmed() {
-            if let Some(pending) = self.downlinks.front_mut() {
-                pending.ack = true;
-            } else {
-                let ack = Frame::new(
-                    MType::UnconfirmedDown,
-                    self.dev_addr,
-                    self.fcnt_down,
-                    0,
-                    &[],
-                )?;
-                self.fcnt_down += 1;
-                self.downlinks.push_back(ack.acknowledging());
-            }
-        }
-        Ok(())
+        self.fcnt_up = Some(fcnt);
+        self.last_up = bytes.to_vec();
+        let answer = if frame.mtype.is_confirmed() {
+            let ack = Frame::new(
+                MType::UnconfirmedDown,
+                self.dev_addr,
+                self.fcnt_down,
+                PORT_COMMANDS,
+                &[],
+            )?;
+            Some(self.sealed(&ack.acknowledging(), keys))
+        } else {
+            None
+        };
+        Ok(Some(Uplink { ack, answer }))
     }
 
-    fn fragment(&mut self, payload: &[u8]) -> Result<()> {
-        let (flags, chunk) = payload
-            .split_first()
-            .ok_or_else(|| protocol_error("a fragment without its flags"))?;
-        if flags & frame::FIRST != 0 {
-            self.arriving.clear();
-        }
-        self.arriving.extend_from_slice(chunk);
-        if flags & frame::LAST != 0 {
-            let whole = std::mem::take(&mut self.arriving);
-            self.complete.push_back((frame::PORT_FRAGMENT, whole));
-        }
-        Ok(())
-    }
-
-    /// Queue a downlink carrying `bytes` on `port` for the device's next
-    /// receive window.
+    /// `bytes` on `port` as a frame down of type `mtype`, sealed under
+    /// `keys` with the next counter down.
     ///
     /// # Errors
     /// More than one frame carries.
-    pub fn downlink(&mut self, port: u8, bytes: &[u8]) -> Result<()> {
-        let frame = Frame::new(
-            MType::UnconfirmedDown,
-            self.dev_addr,
-            self.fcnt_down,
-            port,
-            bytes,
-        )?;
+    pub fn downlink(
+        &mut self,
+        mtype: MType,
+        port: u8,
+        bytes: &[u8],
+        keys: &Keys,
+    ) -> Result<Vec<u8>> {
+        let frame = Frame::new(mtype, self.dev_addr, self.fcnt_down, port, bytes)?;
+        Ok(self.sealed(&frame, keys))
+    }
+
+    /// `frame` sealed, its counter spent.
+    fn sealed(&mut self, frame: &Frame, keys: &Keys) -> Vec<u8> {
         self.fcnt_down += 1;
-        self.downlinks.push_back(frame);
-        Ok(())
+        frame.seal(keys)
     }
 
-    /// The next downlink for the device, sealed.
-    pub fn next_downlink(&mut self) -> Option<Vec<u8>> {
-        self.downlinks
-            .pop_front()
-            .map(|frame| frame.seal(&self.keys))
-    }
-
-    /// The next Stream that arrived whole: the port it came on and its bytes.
-    pub fn take(&mut self) -> Option<(u8, Vec<u8>)> {
+    /// The next Stream that arrived whole.
+    pub fn take(&mut self) -> Option<Whole> {
         self.complete.pop_front()
     }
 }
@@ -138,6 +137,7 @@ impl NetworkServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fragment::{self, PORT_FRAGMENT, PORT_STREAM};
 
     const DEV_ADDR: u32 = 0x2601_1b2c;
 
@@ -155,95 +155,134 @@ mod tests {
     }
 
     #[test]
-    fn fragments_come_back_together_and_a_confirmed_uplink_is_acknowledged() {
-        let mut server = NetworkServer::new(DEV_ADDR, keys());
+    fn fragments_come_back_together_and_a_confirmed_uplink_is_answered() {
+        let mut server = NetworkServer::new(DEV_ADDR);
         let long: Vec<u8> = (0..300u32)
             .map(|n| u8::try_from(n % 256).unwrap_or(0))
             .collect();
-        for (fcnt, (port, payload)) in frame::payloads(&long).into_iter().enumerate() {
+        let mut answers = Vec::new();
+        for (fcnt, (port, payload)) in fragment::payloads(&long).into_iter().enumerate() {
             let mtype = if fcnt == 1 {
                 MType::ConfirmedUp
             } else {
                 MType::UnconfirmedUp
             };
             let fcnt = u32::try_from(fcnt).unwrap_or(0);
-            server
-                .uplink(&uplink(mtype, fcnt, port, &payload))
-                .expect("uplink");
+            let heard = server
+                .uplink(&uplink(mtype, fcnt, port, &payload), &keys())
+                .expect("uplink")
+                .expect("not heard before");
+            answers.extend(heard.answer);
         }
-        assert_eq!(server.take(), Some((frame::PORT_FRAGMENT, long)));
+        let whole = server.take().expect("whole");
+        assert_eq!(
+            (whole.port, whole.fcnt, whole.bytes),
+            (PORT_FRAGMENT, 1, long)
+        );
         assert!(server.take().is_none());
-        let ack = server.next_downlink().expect("an ack");
-        let ack = Frame::open(&ack, &keys(), 0).expect("open");
+        assert_eq!(answers.len(), 1, "one answer for one confirmed frame");
+        let ack = Frame::open(&answers[0], &keys(), 0).expect("open");
         assert!(ack.ack && ack.mtype == MType::UnconfirmedDown && ack.fcnt == 0);
-        assert!(
-            server.next_downlink().is_none(),
-            "one ack for one confirmed frame"
+        assert_eq!(
+            (ack.port, ack.payload.len()),
+            (0, 0),
+            "a bare acknowledgement"
         );
         server
-            .uplink(&uplink(MType::UnconfirmedUp, 2, 1, b""))
+            .uplink(&uplink(MType::UnconfirmedUp, 2, 1, b""), &keys())
             .expect("empty");
-        assert_eq!(server.take(), Some((frame::PORT_STREAM, Vec::new())));
+        let empty = server.take().expect("an empty Stream");
+        assert_eq!((empty.port, empty.bytes), (PORT_STREAM, Vec::new()));
     }
 
     #[test]
-    fn a_counter_that_does_not_advance_is_refused_as_are_strangers() {
-        let mut server = NetworkServer::new(DEV_ADDR, keys());
-        server
-            .uplink(&uplink(MType::UnconfirmedUp, 5, 1, b"a"))
-            .expect("first");
-        assert!(
-            server
-                .uplink(&uplink(MType::UnconfirmedUp, 5, 1, b"a"))
-                .is_err(),
-            "replay"
+    fn a_second_gateways_copy_is_taken_once_and_a_counter_must_advance() {
+        let mut server = NetworkServer::new(DEV_ADDR);
+        let first = uplink(MType::UnconfirmedUp, 5, 1, b"a");
+        assert!(server.uplink(&first, &keys()).expect("first").is_some());
+        assert_eq!(
+            server.uplink(&first, &keys()).expect("again"),
+            None,
+            "a copy"
         );
-        assert!(
-            server
-                .uplink(&uplink(MType::UnconfirmedUp, 4, 1, b"a"))
-                .is_err(),
-            "backwards"
-        );
-        assert!(
-            server
-                .uplink(&uplink(MType::UnconfirmedUp, 6, 9, b"a"))
-                .is_err(),
-            "port"
-        );
-        assert!(
-            server
-                .uplink(&uplink(MType::UnconfirmedDown, 6, 1, b"a"))
-                .is_err(),
-            "down"
-        );
-        assert!(
-            server
-                .uplink(&uplink(MType::UnconfirmedUp, 6, 2, b""))
-                .is_err(),
-            "no flags"
-        );
+        let elsewhere = Keys {
+            nwk_s_key: [0x33; 16],
+            ..keys()
+        };
+        let foreign = Frame::new(MType::UnconfirmedUp, DEV_ADDR, 6, 1, b"z")
+            .expect("frame")
+            .seal(&elsewhere);
+        let heard = server
+            .uplink(&foreign, &keys())
+            .expect("not this session's");
+        assert_eq!(heard, None, "another network's device at the same address");
+        let replayed = uplink(MType::UnconfirmedUp, 5, 1, b"x");
+        assert!(server.uplink(&replayed, &keys()).is_err(), "replay");
+        let backwards = uplink(MType::UnconfirmedUp, 4, 1, b"a");
+        assert!(server.uplink(&backwards, &keys()).is_err(), "backwards");
+        let port = uplink(MType::UnconfirmedUp, 6, 9, b"a");
+        assert!(server.uplink(&port, &keys()).is_err(), "port");
+        let down = uplink(MType::UnconfirmedDown, 6, 1, b"a");
+        assert!(server.uplink(&down, &keys()).is_err(), "down");
+        let flagless = uplink(MType::UnconfirmedUp, 6, 2, b"");
+        assert!(server.uplink(&flagless, &keys()).is_err(), "no flags");
         let stranger = Frame::new(MType::UnconfirmedUp, 7, 6, 1, b"a")
             .expect("frame")
             .seal(&keys());
-        assert!(server.uplink(&stranger).is_err(), "another device");
-        server
-            .uplink(&uplink(MType::UnconfirmedUp, 6, 1, b"b"))
-            .expect("advances");
-        assert_eq!(server.take(), Some((1, b"a".to_vec())));
-        assert_eq!(server.take(), Some((1, b"b".to_vec())));
+        assert!(server.uplink(&stranger, &keys()).is_err(), "another device");
+        let next = uplink(MType::UnconfirmedUp, 6, 1, b"b");
+        let heard = server
+            .uplink(&next, &keys())
+            .expect("advances")
+            .expect("new");
+        assert_eq!(
+            heard,
+            Uplink {
+                ack: false,
+                answer: None
+            }
+        );
+        assert_eq!(server.take().map(|whole| whole.bytes), Some(b"a".to_vec()));
+        assert_eq!(server.take().map(|whole| whole.bytes), Some(b"b".to_vec()));
     }
 
     #[test]
     fn a_downlink_is_sealed_for_the_device_with_its_own_counter() {
-        let mut server = NetworkServer::new(DEV_ADDR, keys());
-        server.downlink(3, b"set 20").expect("downlink");
-        server.downlink(3, b"set 21").expect("downlink");
-        let second = server.next_downlink().and_then(|_| server.next_downlink());
-        let frame = Frame::open(&second.expect("second"), &keys(), 0).expect("open");
+        let mut server = NetworkServer::new(DEV_ADDR);
+        let first = server
+            .downlink(MType::UnconfirmedDown, 3, b"set 20", &keys())
+            .expect("downlink");
+        let second = server
+            .downlink(MType::ConfirmedDown, 3, b"set 21", &keys())
+            .expect("downlink");
+        assert_eq!(Frame::open(&first, &keys(), 0).expect("open").fcnt, 0);
+        let frame = Frame::open(&second, &keys(), 0).expect("open");
         assert_eq!(
-            (frame.port, frame.payload.as_slice(), frame.fcnt),
-            (3, &b"set 21"[..], 1)
+            (
+                frame.mtype,
+                frame.port,
+                frame.payload.as_slice(),
+                frame.fcnt
+            ),
+            (MType::ConfirmedDown, 3, &b"set 21"[..], 1)
         );
-        assert!(server.downlink(3, &[0; 223]).is_err());
+        assert!(
+            server
+                .downlink(MType::UnconfirmedDown, 3, &[0; 223], &keys())
+                .is_err()
+        );
+        let acknowledging = Frame::new(MType::UnconfirmedUp, DEV_ADDR, 0, 0, b"")
+            .expect("frame")
+            .acknowledging()
+            .seal(&keys());
+        let heard = server
+            .uplink(&acknowledging, &keys())
+            .expect("ack")
+            .expect("new");
+        assert!(heard.ack, "the device acknowledged");
+        assert!(
+            server.take().is_none(),
+            "a bare acknowledgement is no Stream"
+        );
     }
 }

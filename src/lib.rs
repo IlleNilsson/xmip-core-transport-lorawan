@@ -1,61 +1,77 @@
 #![forbid(unsafe_code)]
 
-//! Streams that arrive over `LoRaWAN`. One frame's `FRMPayload` is one Stream
-//! where it fits; a longer Stream travels as flagged fragments on a port of
-//! its own and arrives whole at the network server.
+//! Streams that arrive over `LoRaWAN`, the long-range, low-power radio of
+//! the meter in the basement and the sensor in the field: a device talks up
+//! to any gateway that hears it, the gateways forward to one network server,
+//! and the server talks down through a gateway as the device listens.
 //!
-//! `LoRaWAN` is the long-range, low-power radio of the meter in the basement
-//! and the sensor in the field: a device talks up to any gateway that hears
-//! it, the gateways forward to one network server, and the server talks
-//! down in the device's receive windows. What is here is the MAC frame —
-//! message type, device address, frame control and counter, port, the
-//! `FRMPayload` under the application session key and the MIC under the
-//! network session key, AES-128 as the specification uses it — confirmed
-//! and unconfirmed data in both directions, and a fragmented Stream. A Send
-//! Location is the device sending up; a Receive Location is the device
-//! taking what comes down.
+//! **A node is the network server.** A Location's address is where the node
+//! listens for the gateways pointed at it, over Semtech's UDP packet
+//! forwarder protocol, version 2 (`datagram.rs`, `packet.rs`): a gateway
+//! running Semtech's packet forwarder names the node as its server, and
+//! `lorawan://0.0.0.0` listens on port 1700, where the address names none.
+//! The Locations of a node at one address share its socket and each
+//! device's session (`gateways.rs`, `server.rs`). A Receive Location takes
+//! what one device sends up, whole; a Send Location sends a Stream down to
+//! it. The origin names the gateway that heard the device last and the
+//! device: `lorawan://aa555a0000000000/26011b2c?port=1&fcnt=0`.
 //!
-//! **A confirmed frame down is acknowledged after the whole receive
-//! cycle**: on [`transport::Verdict::Accepted`] the device's next frame up
-//! carries its ACK bit; on [`transport::Verdict::Failed`] it does not, and
-//! the network server sends the frame again. `LoRaWAN` has no negative
-//! acknowledgement — the ACK bit is the only answer (`LoRaWAN` L2 1.0.4,
-//! section 4.3.1.2, message acknowledgement) — so nothing tells a network
-//! server *refused, do not send again*: on [`transport::Verdict::Refused`]
-//! the ACK bit rides up too, the frame taken and not sent again, and the
-//! refusal is what the runtime audited. An unconfirmed frame down asks
-//! for no ACK: acceptance is at-most-once there ([`AT_MOST_ONCE`]). Each
-//! Stream arrives whole.
+//! What is carried is the MAC frame (`frame.rs`) — message type, device
+//! address, frame control and counter, port, the `FRMPayload` under the
+//! application session key and the MIC under the network session key,
+//! AES-128 as the specification uses it — confirmed and unconfirmed data
+//! both ways, and a Stream longer than a frame in fragments on a port of
+//! its own (`fragment.rs`). A device's session is activated by
+//! personalization: its address is a setting and its keys the secret its
+//! Location names. Joining over the air is not built.
 //!
-//! The radio is a trait: [`LoopbackRadio`] is a gateway and network server
-//! in-process, which every test and every box without a concentrator
-//! drives, the way hart drives its loopback line. The origin URI names the
-//! radio, the device and the port: `lorawan://loopback/26011b2c?port=2`.
+//! **A confirmed frame up is answered in the device's first receive
+//! window**, a second after it ended on its gateway's clock, before the
+//! receive cycle has ended, since the window does not wait for it:
+//! acceptance is at-most-once here (`AT_MOST_ONCE_UP`). **A Send Location
+//! sends at once**, on the frequency and at the data rate it says, where a
+//! Class C device listens; a confirmed one waits for the device's
+//! acknowledgement in its next frame up.
+//!
+//! The far end is a device behind a gateway (`device.rs`), the gateway a
+//! packet forwarder of this crate's own (`forwarder.rs`), which needs no
+//! radio: the loopback stands both ends on this machine, over UDP.
 //!
 //! **Built with its `declaration` feature alone** the crate is
-//! [`declaration`], what a Location of it is configured with, wherever it
-//! is built, and none of the code above, which is behind the default
-//! feature: what the surfaces' library carries (ADR-0064, amendment
-//! 2026-11-26). The wait a Location takes unless it says,
-//! `DEFAULT_TIMEOUT`, is declared there with it.
+//! `declaration`, what a Location of it is configured with, wherever it is
+//! built, and none of the code above, which is behind the default feature:
+//! what the surfaces' library carries (ADR-0064, amendment 2026-11-26).
+//! The wait a Location takes unless it says, `DEFAULT_TIMEOUT`, and the
+//! port an address that names none listens on, `PORT`, are declared there
+//! with it.
 
 #[cfg(feature = "default")]
 pub mod aes;
 #[cfg(feature = "default")]
 mod configured;
+#[cfg(feature = "default")]
+pub mod datagram;
+#[cfg(feature = "default")]
+pub mod deadline;
 #[cfg(feature = "declaration")]
 pub mod declaration;
 #[cfg(feature = "default")]
+pub mod device;
+#[cfg(feature = "default")]
+pub mod forwarder;
+#[cfg(feature = "default")]
+pub mod fragment;
+#[cfg(feature = "default")]
 pub mod frame;
+#[cfg(feature = "default")]
+pub mod gateways;
+#[cfg(feature = "default")]
+pub mod packet;
 #[cfg(feature = "default")]
 mod radio;
 #[cfg(feature = "default")]
 pub mod server;
 
-#[cfg(feature = "default")]
-use std::collections::VecDeque;
-#[cfg(feature = "default")]
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "default")]
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "default")]
@@ -64,208 +80,236 @@ use std::time::Duration;
 use xcore::lock::Locked;
 
 #[cfg(feature = "default")]
-use declaration::DEFAULT_TIMEOUT;
+use deadline::Deadline;
+#[cfg(feature = "default")]
+use declaration::{DEFAULT_DATA_RATE, DEFAULT_FREQUENCY, DEFAULT_TIMEOUT};
+#[cfg(feature = "default")]
+pub use device::{BehindGateway, Device, EndDevice};
+#[cfg(feature = "default")]
+pub use forwarder::Forwarder;
 #[cfg(feature = "default")]
 pub use frame::{Frame, Keys, MType};
 #[cfg(feature = "default")]
-pub use radio::{LoopbackRadio, Radio};
+pub use gateways::Gateways;
+#[cfg(feature = "default")]
+pub use radio::Radio;
 #[cfg(feature = "default")]
 pub use server::NetworkServer;
 #[cfg(feature = "default")]
-use transport::ArrivalIdentity;
-#[cfg(feature = "default")]
 use transport::error::{Result, TransportError, protocol_error};
-#[cfg(feature = "default")]
-use transport::held::Held;
 #[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 #[cfg(feature = "default")]
-use transport::{Acknowledgement, Arrived, Configured, Directions, Taken, Transport, Verdict};
-
-/// Why an unconfirmed frame down cannot be acknowledged after the receive
-/// cycle.
+use transport::{Acknowledgement, ArrivalIdentity, Arrived, Configured, Directions};
 #[cfg(feature = "default")]
-pub const AT_MOST_ONCE: &str = "an unconfirmed LoRaWAN frame down asks for no ACK: the network \
-                                server sent it once, in the receive window";
+use transport::{Secured, Transport, secured};
 
-/// The device's session: its address, its keys and where its counter is.
-/// Shared by every clone of a transport, because the network refuses a
-/// counter that goes back.
+/// Why a frame up cannot be acknowledged after the receive cycle.
 #[cfg(feature = "default")]
-#[derive(Debug)]
-pub struct Device {
-    pub dev_addr: u32,
-    pub keys: Keys,
-    fcnt_up: Mutex<u32>,
-    fcnt_down: Mutex<Option<u32>>,
-    /// Frames down that carried data as well as an ACK, kept for the next
-    /// receive.
-    held: Mutex<VecDeque<Frame>>,
-    /// A confirmed frame down was accepted: the next frame up carries its
-    /// ACK bit.
-    ack_due: AtomicBool,
-}
+pub const AT_MOST_ONCE_UP: &str = "a confirmed LoRaWAN frame up is answered in the device's \
+                                   first receive window, a second after it, which does not wait \
+                                   for the receive cycle to end";
 
+/// How long after its frame up ends a device opens its first receive
+/// window, in microseconds on its gateway's clock: `RECEIVE_DELAY1`, one
+/// second, in the `LoRaWAN` Regional Parameters.
 #[cfg(feature = "default")]
-impl Device {
-    #[must_use]
-    pub const fn new(dev_addr: u32, keys: Keys) -> Self {
-        Self {
-            dev_addr,
-            keys,
-            fcnt_up: Mutex::new(0),
-            fcnt_down: Mutex::new(None),
-            held: Mutex::new(VecDeque::new()),
-            ack_due: AtomicBool::new(false),
-        }
-    }
+const RECEIVE_DELAY1: u32 = 1_000_000;
 
-    fn next_fcnt_up(&self) -> u32 {
-        let mut fcnt = self.fcnt_up.locked();
-        let next = *fcnt;
-        *fcnt += 1;
-        next
-    }
-}
+/// The power a downlink is sent at, in dBm: within what EU868 permits on
+/// every one of its channels.
+#[cfg(feature = "default")]
+const POWER: i64 = 14;
 
-/// One device on one radio.
+/// The device a loopback is the network server of.
+#[cfg(feature = "default")]
+const LOOPBACK_DEVICE: u32 = 0x2601_1b2c;
+
+/// The session keys of a loopback's device.
+#[cfg(feature = "default")]
+const LOOPBACK_KEYS: Keys = Keys {
+    nwk_s_key: [0x2b; 16],
+    app_s_key: [0x7e; 16],
+};
+
+/// The gateway a loopback's far end is behind: the identifier Semtech's
+/// packet forwarder ships with, `AA555A0000000000`.
+#[cfg(feature = "default")]
+const LOOPBACK_GATEWAY: datagram::Eui = [0xaa, 0x55, 0x5a, 0, 0, 0, 0, 0];
+
+/// The network server's side of one device, behind the gateways pointed at
+/// one address of the node.
 #[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct LorawanTransport {
-    radio: Arc<dyn Radio>,
-    device: Arc<Device>,
+    gateways: Arc<Gateways>,
+    session: Arc<Mutex<NetworkServer>>,
+    dev_addr: u32,
+    /// The session keys it was built with, as `Keys::to_hex` writes them,
+    /// where its Location names no secret: a loopback's.
+    kept: String,
+    secured: Option<Secured>,
     confirmed: bool,
+    /// Where a downlink is sent: in hertz, and at which data rate.
+    frequency: u32,
+    data_rate: String,
     timeout: Duration,
-    /// Set on a loopback: the radio holds the network server.
-    loopback: Option<Arc<LoopbackRadio>>,
+    /// What its waits are counted on: its node's Clock, the operating
+    /// system's until it is handed one (`Configured::timed_by`).
+    clock: Arc<dyn xcore::Clock>,
 }
 
 #[cfg(feature = "default")]
 impl LorawanTransport {
-    /// `device` on `radio`, sending unconfirmed.
+    /// The network server's side of `dev_addr`, behind the gateways pointed
+    /// at `address`, a host and port — `declaration::PORT` where it names
+    /// none — sending unconfirmed. Nothing is bound until it is listened on
+    /// or sent from.
     #[must_use]
-    pub fn new(radio: Arc<dyn Radio>, device: Arc<Device>) -> Self {
+    pub fn listening_at(address: &str, dev_addr: u32) -> Self {
+        let bind = net::authority::with_default_port(address, declaration::PORT);
         Self {
-            radio,
-            device,
+            gateways: Arc::new(Gateways::new(&bind)),
+            session: Arc::new(Mutex::new(NetworkServer::new(dev_addr))),
+            dev_addr,
+            kept: String::new(),
+            secured: None,
             confirmed: false,
+            frequency: u32::try_from(DEFAULT_FREQUENCY).unwrap_or(u32::MAX),
+            data_rate: DEFAULT_DATA_RATE.to_string(),
             timeout: DEFAULT_TIMEOUT,
-            loopback: None,
+            clock: Arc::new(xcore::SystemClock),
         }
     }
 
-    /// Send confirmed: every frame up waits for the ACK down.
+    /// With the session keys `keys`, where its Location names no secret.
+    #[must_use]
+    pub fn keyed(mut self, keys: Keys) -> Self {
+        self.kept = keys.to_hex();
+        self
+    }
+
+    /// Send confirmed: every Stream down waits for the device's ACK up.
     #[must_use]
     pub const fn confirmed(mut self) -> Self {
         self.confirmed = true;
         self
     }
 
-    /// `lorawan://<radio>/<device address>`.
-    #[must_use]
-    pub fn origin(&self) -> String {
+    /// The session keys, read now from the secret its Location names, or
+    /// those it was built with.
+    fn keys(&self) -> Result<Keys> {
+        let held = secured::presented(self.secured.as_ref(), &self.kept, "lorawan")?;
+        Keys::from_hex(&held)
+    }
+
+    /// `lorawan://<gateway>/<device address>?port=<port>&fcnt=<counter>`,
+    /// the gateway the one that heard the device last.
+    fn origin(&self, port: u8, fcnt: u32) -> String {
+        let gateway = self
+            .gateways
+            .heard_by(self.dev_addr)
+            .map_or_else(|| "unheard".to_string(), |eui| datagram::shown(&eui));
         format!(
-            "lorawan://{}/{:08x}",
-            self.radio.name(),
-            self.device.dev_addr
+            "lorawan://{gateway}/{:08x}?port={port}&fcnt={fcnt}",
+            self.dev_addr
         )
     }
 
-    /// The next frame down, opened, or `None` when the window closed empty.
-    fn next_down(&self) -> Result<Option<Frame>> {
-        let Some(bytes) = self.radio.receive(self.timeout)? else {
-            return Ok(None);
+    /// One uplink taken into the device's session, a confirmed one answered
+    /// in its first receive window through the gateway that heard it:
+    /// whether it acknowledged the last confirmed frame down.
+    fn took(&self, uplink: &gateways::Uplink, keys: &Keys, until: &Deadline) -> Result<bool> {
+        let Some(heard) = self.session.locked().uplink(&uplink.rxpk.data, keys)? else {
+            return Ok(false);
         };
-        let mut last = self.device.fcnt_down.locked();
-        let expected = last.map_or(0, |n| n + 1);
-        let frame = Frame::open(
-            &bytes,
-            &self.device.keys,
-            u16::try_from(expected >> 16).unwrap_or(0),
-        )?;
-        if frame.mtype.is_uplink() || frame.dev_addr != self.device.dev_addr {
-            return Err(protocol_error("a frame down that is not for this device"));
+        if let Some(answer) = heard.answer {
+            let txpk = packet::Txpk::answering(&uplink.rxpk, RECEIVE_DELAY1, POWER, answer);
+            self.gateways.transmit(Some(uplink.gateway), &txpk, until)?;
         }
-        *last = Some(frame.fcnt);
-        Ok(Some(frame))
+        Ok(heard.ack)
     }
 
-    /// Send `bytes` up as one frame, or as fragments, confirmed as
-    /// configured.
+    /// The next Stream the device sent up, whole, or `None` where none was
+    /// whole within the timeout. Acceptance is at-most-once
+    /// ([`AT_MOST_ONCE_UP`]).
     ///
     /// # Errors
-    /// Where the radio refused a frame, or a confirmed frame went
-    /// unacknowledged.
+    /// Where the gateways' socket could not be read, the session's keys
+    /// not, or a frame of the session's is refused: a counter that did not
+    /// advance, a port this crate does not carry. A frame that does not open
+    /// under its keys is not the session's, and is read past.
+    pub fn receive_one(&self) -> Result<Option<Arrived>> {
+        let until = Deadline::after(&self.clock, self.timeout);
+        let mut keys = None;
+        loop {
+            if let Some(whole) = self.session.locked().take() {
+                let origin = self.origin(whole.port, whole.fcnt);
+                let acknowledgement = Acknowledgement::at_most_once(AT_MOST_ONCE_UP);
+                return Ok(Some(Arrived::whole(origin, whole.bytes, acknowledgement)));
+            }
+            let Some(uplink) = self.gateways.uplink(self.dev_addr, &until)? else {
+                return Ok(None);
+            };
+            if keys.is_none() {
+                keys = Some(self.keys()?);
+            }
+            if let Some(keys) = &keys {
+                self.took(&uplink, keys, &until)?;
+            }
+        }
+    }
+
+    /// `bytes` sent down to the device, in one frame or in fragments, each
+    /// at once through the gateway that heard it last; confirmed, its last
+    /// frame confirmed and the device's acknowledgement waited for.
+    ///
+    /// # Errors
+    /// Where the session's keys could not be read, no gateway took a frame,
+    /// or a confirmed Stream went unacknowledged.
     pub fn send_stream(&self, bytes: &[u8]) -> Result<()> {
-        let mtype = if self.confirmed {
-            MType::ConfirmedUp
-        } else {
-            MType::UnconfirmedUp
-        };
-        for (port, payload) in frame::payloads(bytes) {
-            let fcnt = self.device.next_fcnt_up();
-            let mut frame = Frame::new(mtype, self.device.dev_addr, fcnt, port, &payload)?;
-            if self.device.ack_due.swap(false, Ordering::Relaxed) {
-                frame = frame.acknowledging();
-            }
-            self.radio.transmit(&frame.seal(&self.device.keys))?;
-            if self.confirmed {
-                let down = self
-                    .next_down()?
-                    .ok_or_else(|| TransportError::retryable("no ACK in the receive windows"))?;
-                if !down.ack {
-                    return Err(protocol_error("a frame down without the ACK bit"));
-                }
-                if !Self::is_bare_ack(&down) {
-                    self.device.held.locked().push_back(down);
-                }
-            }
+        let keys = self.keys()?;
+        if self.confirmed {
+            // Its acknowledgement may come up the moment the last frame is
+            // down, before this thread looks for it.
+            self.gateways.expecting(self.dev_addr);
+        }
+        let until = Deadline::after(&self.clock, self.timeout);
+        let payloads = fragment::payloads(bytes);
+        let last = payloads.len() - 1;
+        let freq = f64::from(self.frequency) / 1_000_000.0;
+        for (index, (port, payload)) in payloads.into_iter().enumerate() {
+            let mtype = if self.confirmed && index == last {
+                MType::ConfirmedDown
+            } else {
+                MType::UnconfirmedDown
+            };
+            let sealed = self
+                .session
+                .locked()
+                .downlink(mtype, port, &payload, &keys)?;
+            let txpk = packet::Txpk::now(freq, &self.data_rate, POWER, sealed);
+            let gateway = self.gateways.heard_by(self.dev_addr);
+            self.gateways.transmit(gateway, &txpk, &until)?;
+        }
+        if self.confirmed {
+            return self.acknowledged(&keys, &until);
         }
         Ok(())
     }
 
-    /// Whether a frame down carries nothing but its ACK bit.
-    fn is_bare_ack(frame: &Frame) -> bool {
-        frame.port == 0 && frame.payload.is_empty()
-    }
-
-    /// The next Stream down with a payload, whole — one held from a
-    /// confirmed send, else the next off the radio — or `None` when the
-    /// windows closed empty. A bare ACK carries nothing and is not a
-    /// Stream. A confirmed frame down is acknowledged by the arrival's
-    /// verdict: accepted, the device's next frame up carries its ACK bit;
-    /// refused, it does not, and the network server sends it again. An
-    /// unconfirmed one is at-most-once ([`AT_MOST_ONCE`]).
-    ///
-    /// # Errors
-    /// Where the radio could not be read or the frame does not open.
-    pub fn receive_one(&self) -> Result<Option<Arrived>> {
-        let held = self.device.held.locked().pop_front();
-        let mut next = match held {
-            Some(frame) => Some(frame),
-            None => self.next_down()?,
-        };
-        while let Some(frame) = next {
-            if Self::is_bare_ack(&frame) {
-                next = self.next_down()?;
-                continue;
+    /// The device's acknowledgement, in a frame up before `until`; what any
+    /// frame up carries meanwhile kept for a receive.
+    fn acknowledged(&self, keys: &Keys, until: &Deadline) -> Result<()> {
+        while let Some(uplink) = self.gateways.uplink(self.dev_addr, until)? {
+            if self.took(&uplink, keys, until)? {
+                return Ok(());
             }
-            let origin = format!("{}?port={}&fcnt={}", self.origin(), frame.port, frame.fcnt);
-            let acknowledgement = if frame.mtype == MType::ConfirmedDown {
-                let device = Arc::clone(&self.device);
-                Acknowledgement::deferred(move |verdict| {
-                    // LoRaWAN has no negative acknowledgement: a refused
-                    // frame is acknowledged, taken for good.
-                    let acknowledged = !matches!(verdict, Verdict::Failed);
-                    device.ack_due.store(acknowledged, Ordering::Relaxed);
-                    Ok(())
-                })
-            } else {
-                Acknowledgement::at_most_once(AT_MOST_ONCE)
-            };
-            return Ok(Some(Arrived::whole(origin, frame.payload, acknowledgement)));
         }
-        Ok(None)
+        Err(TransportError::retryable(format!(
+            "device {:08x} did not acknowledge the Stream in time",
+            self.dev_addr
+        )))
     }
 }
 
@@ -280,26 +324,24 @@ impl Transport for LorawanTransport {
     }
 
     fn arrivals(&self) -> transport::Arrivals {
-        transport::Arrivals::Ordered("one line or bus, answered in the order it speaks")
+        transport::Arrivals::Ordered("one device's frames, in the order of its frame counter")
     }
 
     fn waiting(&self) -> transport::Waiting {
-        transport::Waiting::Polled("a read of the loopback radio returns at once")
+        transport::Waiting::Waits("a read of the gateways' socket waits for an uplink")
     }
 
-    /// An empty receive window is not an error: an empty vector. A
-    /// confirmed frame down is acknowledged after the receive cycle, by the
-    /// next frame up; an unconfirmed one is at-most-once
-    /// ([`AT_MOST_ONCE`]).
+    /// A timeout with nothing whole is not an error: an empty vector.
+    /// Acceptance is at-most-once ([`AT_MOST_ONCE_UP`]).
     fn receive_up_to(&self, _most: usize) -> Result<Vec<Arrived>> {
         Ok(self.receive_one()?.into_iter().collect())
     }
 
     fn sending(&self) -> transport::Sending {
-        transport::Sending::Gathered("one LoRaWAN frame carries the whole body")
+        transport::Sending::Gathered("a Stream is sealed into frames, each one downlink")
     }
 
-    /// The target is the network: a device sends to whoever hears it.
+    /// The target is the device the Location names, through its gateway.
     fn send_from(&self, _target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
         let bytes: &[u8] = &outgoing.gather()?;
         self.send_stream(bytes)
@@ -308,25 +350,14 @@ impl Transport for LorawanTransport {
 
 #[cfg(feature = "default")]
 impl LorawanTransport {
-    /// Both ends on one in-process radio: a device sending confirmed, and
-    /// the network server that opens and acknowledges what it sends, the
-    /// loopback timeout on the receive windows.
+    /// Both ends on this machine: the network server on an ephemeral port
+    /// of loopback with a device's session and its keys, and the loopback
+    /// timeout on every wait.
     #[must_use]
     pub fn loopback() -> Self {
-        let keys = Keys {
-            nwk_s_key: [0x2b; 16],
-            app_s_key: [0x7e; 16],
-        };
-        let dev_addr = 0x2601_1b2c;
-        let radio = Arc::new(LoopbackRadio::new(NetworkServer::new(dev_addr, keys)));
-        let mut transport = Self::new(
-            Arc::clone(&radio) as Arc<dyn Radio>,
-            Arc::new(Device::new(dev_addr, keys)),
-        )
-        .confirmed()
-        .timing_out_after(LOOPBACK_TIMEOUT);
-        transport.loopback = Some(radio);
-        transport
+        Self::listening_at("127.0.0.1:0", LOOPBACK_DEVICE)
+            .keyed(LOOPBACK_KEYS)
+            .timing_out_after(LOOPBACK_TIMEOUT)
     }
 }
 
@@ -334,42 +365,36 @@ impl LorawanTransport {
 impl Loopback for LorawanTransport {
     fn arrival_identity(&self) -> ArrivalIdentity {
         ArrivalIdentity::Unnamed(
-            "a downlink is the network server's, and the frame names only this device",
+            "a frame names its device by its address alone, which its MIC under the session \
+             key vouches for",
         )
     }
 
-    /// The network server, holding what arrived whole.
+    /// The device, behind a gateway pointed at this transport's socket,
+    /// which it binds.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        let radio = self
-            .loopback
-            .as_ref()
-            .ok_or_else(|| protocol_error("a concentrator, not a loopback radio"))?;
-        let radio = Arc::clone(radio);
-        let origin = self.origin();
-        Ok(Box::new(Held::new(origin.clone(), move || {
-            let (port, bytes) = radio
-                .server()
-                .take()
-                .ok_or_else(|| protocol_error("nothing arrived at the network server"))?;
-            Ok(Taken::new(format!("{origin}?port={port}"), bytes))
-        })))
+        self.gateways.expecting(self.dev_addr);
+        let address = self
+            .gateways
+            .listening()?
+            .ok_or_else(|| protocol_error("the gateways' socket is bound nowhere"))?
+            .to_string();
+        let gateway = Forwarder::pointed_at(&address, LOOPBACK_GATEWAY, self.timeout)?;
+        let device = Arc::new(Device::new(self.dev_addr, self.keys()?));
+        let device = EndDevice::new(Arc::new(gateway), device).waiting(self.timeout);
+        Ok(Box::new(BehindGateway::new(address, device)))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
-        self.clone().send(address, payload)
-    }
-
-    /// In order on one thread: the network server lives in the radio and
-    /// opens each frame as it is sent, so the send goes first and the take
-    /// finds the Stream whole.
-    fn exchanges_in_order(&self) -> bool {
-        true
+        self.send(address, payload)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datagram::Datagram;
+    use std::net::UdpSocket;
     use transport::payload::edge_payloads;
 
     /// The shapes a protocol breaks on, as the System Tests list them.
@@ -384,16 +409,43 @@ mod tests {
         payloads
     }
 
+    /// A device behind a gateway pointed at `node`, which listens.
+    fn behind(node: &LorawanTransport) -> EndDevice {
+        node.gateways.expecting(node.dev_addr);
+        let address = node
+            .gateways
+            .listening()
+            .expect("bound")
+            .expect("an address");
+        let gateway =
+            Forwarder::pointed_at(address, LOOPBACK_GATEWAY, LOOPBACK_TIMEOUT).expect("a gateway");
+        let device = Arc::new(Device::new(node.dev_addr, LOOPBACK_KEYS));
+        EndDevice::new(Arc::new(gateway), device).waiting(LOOPBACK_TIMEOUT)
+    }
+
     #[test]
-    fn a_loopback_round_carries_a_stream_up_to_the_network_server() {
+    fn a_loopback_round_carries_a_stream_down_to_a_device_behind_a_gateway() {
         let loopback = LorawanTransport::loopback();
         let arrived = loopback.round(b"21.5 C").expect("round");
         assert_eq!(arrived.bytes, b"21.5 C");
-        assert_eq!(arrived.origin_uri, "lorawan://loopback/26011b2c?port=1");
+        assert!(
+            arrived.origin_uri.starts_with("lorawan://127.0.0.1:"),
+            "{}",
+            arrived.origin_uri
+        );
+        assert!(
+            arrived.origin_uri.ends_with("/26011b2c?port=1&fcnt=0"),
+            "{}",
+            arrived.origin_uri
+        );
         let long = vec![7; 1000];
         let arrived = loopback.round(&long).expect("fragments");
         assert_eq!(arrived.bytes, long);
-        assert_eq!(arrived.origin_uri, "lorawan://loopback/26011b2c?port=2");
+        assert!(
+            arrived.origin_uri.contains("?port=2&"),
+            "{}",
+            arrived.origin_uri
+        );
         assert!(loopback.ceiling().is_none());
         assert!(loopback.refuses(b"anything").is_none());
         assert_eq!(loopback.name(), "lorawan");
@@ -413,133 +465,148 @@ mod tests {
     }
 
     #[test]
-    fn a_downlink_arrives_as_a_stream_and_a_bare_ack_does_not() {
-        let loopback = LorawanTransport::loopback();
-        assert!(
-            loopback.receive().expect("quiet").is_empty(),
-            "empty is not an error"
-        );
-        let radio = loopback.loopback.as_ref().expect("loopback");
-        radio.server().downlink(3, b"set 20").expect("queued");
-        loopback
-            .send("lorawan://loopback", b"confirmed")
-            .expect("sending");
-        let mut arrived = loopback.receive().expect("receiving");
-        assert_eq!(arrived.len(), 1);
-        let arrived = arrived.remove(0).taken().expect("taken");
-        assert_eq!(arrived.bytes, b"set 20");
-        assert_eq!(
-            arrived.origin_uri,
-            "lorawan://loopback/26011b2c?port=3&fcnt=0"
-        );
-        assert!(
-            loopback.receive().expect("quiet again").is_empty(),
-            "the ACK rode on the downlink; no bare ACK follows"
-        );
-    }
-
-    /// A radio whose frames down are queued by the test and whose frames up
-    /// are kept for it to read.
-    #[derive(Default)]
-    struct Scripted {
-        down: Mutex<VecDeque<Vec<u8>>>,
-        up: Mutex<Vec<Vec<u8>>>,
-    }
-
-    impl Radio for Scripted {
-        fn name(&self) -> &'static str {
-            "scripted"
-        }
-        fn transmit(&self, frame: &[u8]) -> Result<()> {
-            self.up.lock().expect("up").push(frame.to_vec());
-            Ok(())
-        }
-        fn receive(&self, _timeout: Duration) -> Result<Option<Vec<u8>>> {
-            Ok(self.down.lock().expect("down").pop_front())
-        }
+    fn a_device_sends_streams_up_and_each_confirmed_frame_is_answered_in_its_window() {
+        let node = LorawanTransport::loopback();
+        let device = behind(&node).confirmed();
+        let long = vec![9u8; 500];
+        std::thread::scope(|scope| {
+            let sending = scope.spawn(|| {
+                device.send_stream(b"21.5 C")?;
+                device.send_stream(&long)
+            });
+            let first = node.receive_one().expect("first").expect("a Stream");
+            assert_eq!(
+                first.origin_uri,
+                "lorawan://aa555a0000000000/26011b2c?port=1&fcnt=0"
+            );
+            assert!(!first.defers(), "an uplink is at-most-once");
+            assert_eq!(first.taken().expect("taken").bytes, b"21.5 C");
+            let second = node.receive_one().expect("second").expect("a Stream");
+            assert!(
+                second.origin_uri.ends_with("?port=2&fcnt=3"),
+                "{}",
+                second.origin_uri
+            );
+            assert_eq!(second.taken().expect("taken").bytes, long);
+            sending
+                .join()
+                .expect("the device's thread")
+                .expect("every confirmed frame acknowledged");
+        });
+        let quiet = node.timing_out_after(Duration::from_millis(20));
+        assert!(quiet.receive().expect("quiet").is_empty(), "nothing more");
     }
 
     #[test]
-    fn a_confirmed_frame_down_is_acknowledged_by_the_next_frame_up_only_when_accepted() {
-        let keys = Keys {
-            nwk_s_key: [3; 16],
-            app_s_key: [4; 16],
-        };
-        let radio = Arc::new(Scripted::default());
-        let device = LorawanTransport::new(
-            Arc::clone(&radio) as Arc<dyn Radio>,
-            Arc::new(Device::new(9, keys)),
-        );
-        let down = |fcnt, mtype| {
-            let frame = Frame::new(mtype, 9, fcnt, 3, b"set 20").expect("frame");
-            radio
-                .down
-                .lock()
-                .expect("down")
-                .push_back(frame.seal(&keys));
-        };
-        let last_up_acknowledges = || {
-            let up = radio.up.lock().expect("up").pop().expect("a frame up");
-            Frame::open(&up, &keys, 0).expect("open").ack
-        };
-        // Failed: the next frame up carries no ACK, so it is sent again.
-        down(0, MType::ConfirmedDown);
-        let first = device.receive().expect("first").remove(0);
-        assert!(first.defers(), "a confirmed frame down waits for its ACK");
-        first.failed().expect("failed");
-        device.send("", b"C1").expect("up");
-        assert!(!last_up_acknowledges(), "failed: no ACK");
-        // Refused: the ACK rides up, so it is not sent again.
-        down(1, MType::ConfirmedDown);
-        let refused = device.receive().expect("refused").remove(0);
-        refused
-            .refused(transport::Refusal::Unacceptable)
-            .expect("acknowledged");
-        device.send("", b"R1").expect("up");
-        assert!(last_up_acknowledges(), "refused: taken for good");
-        // Accepted: the next frame up carries the ACK bit.
-        down(2, MType::ConfirmedDown);
-        let again = device.receive().expect("again").remove(0);
-        assert_eq!(again.taken().expect("accepted").bytes, b"set 20");
-        device.send("", b"C2").expect("up");
-        assert!(last_up_acknowledges(), "accepted: the ACK rides up");
-        // Unconfirmed: nobody waits.
-        down(3, MType::UnconfirmedDown);
-        let unconfirmed = device.receive().expect("unconfirmed").remove(0);
-        assert!(
-            !unconfirmed.defers(),
-            "an unconfirmed frame down is at-most-once"
-        );
+    fn a_confirmed_stream_down_waits_for_the_device_to_acknowledge_it() {
+        let node = LorawanTransport::loopback().confirmed();
+        let device = behind(&node);
+        std::thread::scope(|scope| {
+            let answering = scope.spawn(|| {
+                let arrived = device.receive_one()?.expect("a Stream");
+                assert!(arrived.defers(), "a confirmed Stream waits for its verdict");
+                let taken = arrived.taken()?;
+                device.send_stream(b"done")?;
+                Ok::<_, TransportError>(taken.bytes)
+            });
+            node.send_stream(b"set 20").expect("acknowledged");
+            assert_eq!(
+                answering.join().expect("the device").expect("taken"),
+                b"set 20"
+            );
+        });
+        let kept = node
+            .receive_one()
+            .expect("kept")
+            .expect("the device's frame");
+        assert_eq!(kept.taken().expect("taken").bytes, b"done");
     }
 
     #[test]
-    fn a_confirmed_frame_nobody_acknowledges_is_worth_trying_again() {
-        struct Silence;
-        impl Radio for Silence {
-            fn name(&self) -> &'static str {
-                "silence"
-            }
-            fn transmit(&self, _frame: &[u8]) -> Result<()> {
-                Ok(())
-            }
-            fn receive(&self, _timeout: Duration) -> Result<Option<Vec<u8>>> {
-                Ok(None)
-            }
-        }
-        let keys = Keys {
-            nwk_s_key: [1; 16],
-            app_s_key: [2; 16],
-        };
-        let device = Arc::new(Device::new(7, keys));
-        let quiet = LorawanTransport::new(Arc::new(Silence), device).confirmed();
-        let error = quiet
-            .send("lorawan://silence", b"anyone?")
-            .expect_err("no ack");
-        assert!(error.retryable, "{error}");
+    fn a_receive_and_a_send_of_one_device_share_the_socket_each_told_what_the_other_read() {
+        let sharing: Arc<dyn transport::Sharing> = Arc::new(transport::Shared::default());
+        let receiving = LorawanTransport::loopback().shared_by(&sharing);
+        let sending = LorawanTransport::loopback().shared_by(&sharing);
+        receiving.listening().expect("bound");
+        let device = behind(&receiving);
+        std::thread::scope(|scope| {
+            let received = scope.spawn(|| receiving.receive_one());
+            let answering = scope.spawn(|| {
+                let down = device.receive_one()?.expect("a Stream down").taken()?;
+                device.send_stream(b"up")?;
+                Ok::<_, TransportError>(down.bytes)
+            });
+            // Whichever Location reads the socket, the other is woken by
+            // the PULL_DATA and the TX_ACK it reads.
+            sending
+                .send_stream(b"down")
+                .expect("sent through the shared socket");
+            assert_eq!(
+                answering.join().expect("the device").expect("took"),
+                b"down"
+            );
+            let up = received.join().expect("the receive").expect("read");
+            assert_eq!(
+                up.expect("a Stream up").taken().expect("taken").bytes,
+                b"up"
+            );
+        });
+    }
+
+    #[test]
+    fn a_gateway_that_refuses_a_downlink_is_named_and_none_asking_is_said() {
+        let quiet = LorawanTransport::loopback().timing_out_after(Duration::from_millis(50));
+        let unheard = quiet.send_stream(b"x").expect_err("no gateway");
         assert!(
-            quiet.far_end().is_err(),
-            "a real radio has no server inside"
+            unheard.retryable && unheard.message.contains("keepalive"),
+            "{unheard}"
         );
-        assert_eq!(quiet.origin(), "lorawan://silence/00000007");
+
+        let node = LorawanTransport::loopback();
+        let address = node
+            .gateways
+            .listening()
+            .expect("bound")
+            .expect("an address");
+        let gateway = UdpSocket::bind("127.0.0.1:0").expect("a gateway's socket");
+        let pull = Datagram::PullData {
+            token: 1,
+            gateway: LOOPBACK_GATEWAY,
+        };
+        gateway.send_to(&pull.encode(), address).expect("pulled");
+        std::thread::scope(|scope| {
+            let refusing = scope.spawn(|| {
+                let until = Deadline::after(&node.clock, LOOPBACK_TIMEOUT);
+                while let Some((bytes, peer)) = datagram::received(&gateway, &until)? {
+                    if let Datagram::PullResp { token, json } = Datagram::decode(&bytes)? {
+                        let late = Datagram::TxAck {
+                            token,
+                            gateway: LOOPBACK_GATEWAY,
+                            json: br#"{"txpk_ack":{"error":"TOO_LATE"}}"#.to_vec(),
+                        };
+                        datagram::sent(&gateway, &late, peer)?;
+                        return packet::Txpk::read(&json);
+                    }
+                }
+                Err(protocol_error("no PULL_RESP"))
+            });
+            let refused = node.send_stream(b"x").expect_err("too late");
+            assert!(
+                refused.retryable && refused.message.contains("TOO_LATE"),
+                "{refused}"
+            );
+            assert!(refused.message.contains("aa555a0000000000"), "{refused}");
+            let txpk = refusing.join().expect("the gateway").expect("a txpk");
+            assert!(txpk.imme && txpk.ipol);
+            assert_eq!(
+                (txpk.freq, txpk.datr.as_str()),
+                (869.525, Some("SF12BW125"))
+            );
+            let frame = Frame::open(&txpk.data, &LOOPBACK_KEYS, 0).expect("the device's");
+            assert_eq!(
+                (frame.mtype, frame.port, frame.payload),
+                (MType::UnconfirmedDown, 1, b"x".to_vec())
+            );
+        });
     }
 }
