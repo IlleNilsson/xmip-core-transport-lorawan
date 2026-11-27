@@ -1,11 +1,11 @@
 [package]
 name = "xmip-core-transport-lorawan"
-version = "0.1.0"
-edition = "2024"
-license = "AGPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 repository = "https://github.com/IlleNilsson/xmip-core-transport-lorawan"
 description = "LoRaWAN transport: a node is the network server its gateways point at over Semtech's UDP packet forwarder protocol, version 2; the MAC frame both ways, confirmed or not, its FRMPayload under AES-128 and CMAC MIC, a long Stream in fragments; a packet forwarder and a device of its own stand in for gateway and radio. A xmip-core-transport technology."
-publish = false
+publish.workspace = true
 
 [lib]
 path = "src/lib.rs"
@@ -51,13 +51,5 @@ declaration = []
 # the capability's test support and never a production build (ADR-0044).
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main", features = ["test-support"] }
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-too_many_lines = "warn"
-pedantic = { level = "warn", priority = -1 }
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
-unwrap_used = "warn"
-expect_used = "allow"
+[lints]
+workspace = true
