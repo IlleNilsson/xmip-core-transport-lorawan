@@ -17,17 +17,17 @@ path = "src/lib.rs"
 # (`transport::sharing`), and the secret holding a session's keys
 # (`transport::secured`). Its declaration takes the capability's `timeout`
 # (`transport::configured::timeout`).
-transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
+transport = { workspace = true }
 # AES-128 and its CMAC, which every LoRaWAN key drives (aes.rs):
 # RustCrypto's, constant-time, the aes the estate's SFTP and Kerberos take.
 aes = { version = "0.9", optional = true }
 cmac = { version = "0.8", optional = true }
 # A PHY payload travels in the protocol's JSON as base 64, and a session's
 # keys are written in hexadecimal: the estate's one codec for both.
-codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main", optional = true }
+codec = { workspace = true, optional = true }
 # The port an address that names none listens on
 # (`net::authority::with_default_port`).
-net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main", optional = true }
+net = { workspace = true, optional = true }
 # The packet forwarder protocol carries `rxpk`, `txpk` and `txpk_ack` as
 # JSON, and serde reads and writes it, as the estate's other transports
 # that speak JSON do.
@@ -36,7 +36,7 @@ serde_json = { version = "1", optional = true }
 # transport::Configured (ADR-0064, amendment 2026-09-26); the lock and the
 # wake the Locations sharing a node's gateways wait on (xcore::lock,
 # xcore::wake).
-xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
+xcore = { workspace = true }
 
 [features]
 # The code and its declaration: the transport guide's "The declaration",
@@ -49,7 +49,7 @@ declaration = []
 [dev-dependencies]
 # The loopback payloads the tests drive and the secrets a test keeps, from
 # the capability's test support and never a production build (ADR-0044).
-transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main", features = ["test-support"] }
+transport = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
